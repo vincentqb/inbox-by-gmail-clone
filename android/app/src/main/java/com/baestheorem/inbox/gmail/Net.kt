@@ -14,6 +14,13 @@ object Net {
         .retryOnConnectionFailure(true)
         .build()
 
+    // Retrying a send POST after losing its response can send a second email.
+    val singleSendClient: OkHttpClient = client.newBuilder()
+        .retryOnConnectionFailure(false)
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .build()
+
     val json = Json {
         ignoreUnknownKeys = true
         coerceInputValues = true

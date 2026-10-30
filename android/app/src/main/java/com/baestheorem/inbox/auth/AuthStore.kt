@@ -7,6 +7,7 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.baestheorem.inbox.BuildConfig
 import java.security.GeneralSecurityException
+import java.util.concurrent.atomic.AtomicLong
 
 // Where the OAuth client and the user's refresh token live. Encrypted at rest
 // under the Android keystore; if that ever fails to open (some OEM images ship
@@ -21,6 +22,9 @@ object AuthStore {
     private const val K_OWN_PROJECT = "own_project"
 
     private lateinit var prefs: SharedPreferences
+    private val version = AtomicLong()
+    /** In-flight requests must never adopt credentials from a newer sign-in. */
+    val sessionVersion: Long get() = version.get()
 
     fun init(context: Context) {
         if (::prefs.isInitialized) return
@@ -51,19 +55,19 @@ object AuthStore {
 
     var clientId: String
         get() = prefs.getString(K_CLIENT_ID, "") ?: ""
-        set(v) = prefs.edit().putString(K_CLIENT_ID, v).apply()
+        set(v) { version.incrementAndGet(); prefs.edit().putString(K_CLIENT_ID, v).apply() }
 
     var clientSecret: String
         get() = prefs.getString(K_CLIENT_SECRET, "") ?: ""
-        set(v) = prefs.edit().putString(K_CLIENT_SECRET, v).apply()
+        set(v) { version.incrementAndGet(); prefs.edit().putString(K_CLIENT_SECRET, v).apply() }
 
     var refreshToken: String
         get() = prefs.getString(K_REFRESH, "") ?: ""
-        set(v) = prefs.edit().putString(K_REFRESH, v).apply()
+        set(v) { version.incrementAndGet(); prefs.edit().putString(K_REFRESH, v).commit() }
 
     var account: String
         get() = prefs.getString(K_ACCOUNT, "") ?: ""
-        set(v) = prefs.edit().putString(K_ACCOUNT, v).apply()
+        set(v) { prefs.edit().putString(K_ACCOUNT, v).commit() }
 
     /** True when the user brought their own Google Cloud project in the wizard. */
     var ownProject: Boolean
@@ -87,11 +91,13 @@ object AuthStore {
 
     /** Drops the token but keeps the client, so re-signing in is one tap. */
     fun signOut() {
-        prefs.edit().remove(K_REFRESH).remove(K_ACCOUNT).apply()
+        version.incrementAndGet()
+        prefs.edit().remove(K_REFRESH).remove(K_ACCOUNT).commit()
     }
 
     /** Full reset, back to the first wizard screen. */
     fun forgetEverything() {
-        prefs.edit().clear().apply()
+        version.incrementAndGet()
+        prefs.edit().clear().commit()
     }
 }

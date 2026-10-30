@@ -83,6 +83,12 @@ object SnoozeStore {
         WorkManager.getInstance(appContext).cancelUniqueWork(workName(threadId))
     }
 
+    fun clear() {
+        _records.value.forEach { WorkManager.getInstance(appContext).cancelUniqueWork(workName(it.threadId)) }
+        _records.value = emptyList()
+        file.delete()
+    }
+
     private fun workName(threadId: String) = "snooze-$threadId"
 
     /**

@@ -1,6 +1,10 @@
 package com.baestheorem.inbox.gmail
 
-import android.util.Base64
+import java.util.Base64
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+import java.util.UUID
 
 // MIME walking, inline-image resolution, quoted-history trimming and RFC 2822
 // building. Port of app.py's body layer via ios/Sources/Bundling.swift.
@@ -14,7 +18,9 @@ fun decodeBody(payload: GPayload?): BodyParts {
         if (part == null) return
         val mime = part.mimeType ?: ""
         val data = part.body?.data
-        if (data != null) {
+        val attachment = !part.filename.isNullOrEmpty() ||
+            headerValue(part.headers, "Content-Disposition").startsWith("attachment", true)
+        if (data != null && !attachment) {
             if (mime == "text/plain" && text.isEmpty()) {
                 base64UrlDecode(data)?.let { text = String(it, Charsets.UTF_8) }
             } else if (mime == "text/html") {
@@ -160,7 +166,7 @@ internal fun stripTags(s: String): String = decodeEntities(tagStripRx.replace(s,
 
 fun encodeHeaderText(s: String): String {
     if (s.all { it.code < 128 }) return s
-    val b64 = Base64.encodeToString(s.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+    val b64 = Base64.getEncoder().encodeToString(s.toByteArray(Charsets.UTF_8))
     return "=?UTF-8?B?$b64?="
 }
 
@@ -182,12 +188,19 @@ fun buildRawMessage(
     fromEmail: String,
     inReplyTo: String?,
     references: String?,
+    messageId: String = "<${UUID.randomUUID()}@inboxclone.invalid>",
+    date: Long = System.currentTimeMillis(),
 ): String {
+    for (header in listOf(to, cc.orEmpty(), subject, fromName, fromEmail, inReplyTo.orEmpty(), references.orEmpty(), messageId)) {
+        require(!header.contains('\r') && !header.contains('\n')) { "Email headers cannot contain line breaks." }
+    }
     val lines = mutableListOf<String>()
     lines.add("To: $to")
     if (!cc.isNullOrEmpty()) lines.add("Cc: $cc")
     if (fromEmail.isNotEmpty()) lines.add("From: ${formatFromAddr(fromName, fromEmail)}")
     lines.add("Subject: ${encodeHeaderText(subject)}")
+    lines.add("Message-ID: $messageId")
+    lines.add("Date: ${DateTimeFormatter.RFC_1123_DATE_TIME.format(Instant.ofEpochMilli(date).atZone(ZoneOffset.UTC))}")
     if (!inReplyTo.isNullOrEmpty()) {
         lines.add("In-Reply-To: $inReplyTo")
         // RFC 2822 wants the full ancestry; fall back to just the parent id
@@ -197,7 +210,7 @@ fun buildRawMessage(
     lines.add("Content-Type: text/plain; charset=\"utf-8\"")
     lines.add("Content-Transfer-Encoding: base64")
     lines.add("")
-    val b64 = Base64.encodeToString(body.toByteArray(Charsets.UTF_8), Base64.CRLF)
+    val b64 = Base64.getMimeEncoder(76, "\r\n".toByteArray()).encodeToString(body.toByteArray(Charsets.UTF_8))
     val raw = lines.joinToString("\r\n") + "\r\n" + b64 + "\r\n"
-    return Base64.encodeToString(raw.toByteArray(Charsets.UTF_8), Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+    return Base64.getUrlEncoder().withoutPadding().encodeToString(raw.toByteArray(Charsets.UTF_8))
 }

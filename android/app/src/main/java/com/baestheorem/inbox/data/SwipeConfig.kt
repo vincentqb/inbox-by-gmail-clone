@@ -81,4 +81,6 @@ object Prefs {
         val merged = (seenUnread() + ids).toList().takeLast(500).toSet()
         prefs.edit().putStringSet(K_SEEN_UNREAD, merged).apply()
     }
+
+    fun clearSeen() { prefs.edit().remove(K_SEEN_UNREAD).apply() }
 }

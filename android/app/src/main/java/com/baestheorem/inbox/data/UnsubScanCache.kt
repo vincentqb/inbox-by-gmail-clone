@@ -63,4 +63,14 @@ object UnsubScanCache {
         queued.addAll(fresh)
         return fresh
     }
+
+    @Synchronized
+    fun clear() {
+        store = Store()
+        queued.clear()
+        file.delete()
+    }
+
+    @Synchronized
+    fun release(messageId: String) { queued.remove(messageId) }
 }

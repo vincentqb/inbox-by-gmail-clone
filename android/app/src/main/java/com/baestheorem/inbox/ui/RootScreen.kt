@@ -1,5 +1,6 @@
 package com.baestheorem.inbox.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
@@ -34,6 +35,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -48,12 +50,16 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.baestheorem.inbox.data.MailMode
 import com.baestheorem.inbox.data.MailStore
+import com.baestheorem.inbox.data.Connectivity
+import com.baestheorem.inbox.data.DraftStatus
+import com.baestheorem.inbox.data.OfflineMail
 import com.baestheorem.inbox.gmail.ThreadSummary
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.io.IOException
 
 @Composable
-fun RootScreen(store: MailStore, onSignedOut: () -> Unit) {
+fun RootScreen(store: MailStore, onSignedOut: () -> Unit, onReauthorize: () -> Unit) {
     val scope = rememberCoroutineScope()
     val mode by store.mode.collectAsState()
     val inbox by store.inbox.collectAsState()
@@ -61,15 +67,40 @@ fun RootScreen(store: MailStore, onSignedOut: () -> Unit) {
     val pinnedOnly by store.pinnedOnly.collectAsState()
     val email by store.userEmail.collectAsState()
     val deepLink by store.deepLinkThreadId.collectAsState()
+    val offline by OfflineMail.status.collectAsState()
+    val drafts by OfflineMail.drafts.collectAsState()
+    val online by Connectivity.online.collectAsState()
+    val expired by store.authExpired.collectAsState()
 
     var drawerOpen by remember { mutableStateOf(false) }
-    var searchOpen by remember { mutableStateOf(false) }
-    var searchText by remember { mutableStateOf("") }
-    var readerThreadId by remember { mutableStateOf<String?>(null) }
-    var composeOpen by remember { mutableStateOf(false) }
+    var searchOpen by rememberSaveable { mutableStateOf(false) }
+    var searchText by rememberSaveable { mutableStateOf("") }
+    var readerThreadId by rememberSaveable { mutableStateOf<String?>(null) }
+    var composeDraftId by rememberSaveable { mutableStateOf<String?>(null) }
+    var creatingDraft by remember { mutableStateOf(false) }
     var settingsOpen by remember { mutableStateOf(false) }
     var snoozeTarget by remember { mutableStateOf<ThreadSummary?>(null) }
     var unsubTarget by remember { mutableStateOf<ThreadSummary?>(null) }
+    var previousAccount by remember { mutableStateOf(email) }
+
+    LaunchedEffect(email) {
+        if (previousAccount.isNotBlank() && previousAccount != email) {
+            readerThreadId = null
+            composeDraftId = null
+            snoozeTarget = null
+            unsubTarget = null
+            settingsOpen = false
+        }
+        previousAccount = email
+    }
+    BackHandler(drawerOpen || searchOpen) {
+        if (drawerOpen) drawerOpen = false
+        else {
+            searchOpen = false
+            searchText = ""
+            if (mode is MailMode.Search) store.switchMode(MailMode.Inbox)
+        }
+    }
 
     LaunchedEffect(deepLink) {
         deepLink?.let {
@@ -108,12 +139,33 @@ fun RootScreen(store: MailStore, onSignedOut: () -> Unit) {
                 onMenu = { drawerOpen = true },
                 onTogglePinned = { store.pinnedOnly.value = !pinnedOnly },
             )
-            MailList(
-                store = store,
-                onOpen = { readerThreadId = it.id },
-                onSnooze = { snoozeTarget = it },
-                onUnsubscribe = { unsubTarget = it },
-            )
+            val banner = when {
+                expired -> "Sign in again · downloaded mail is available"
+                !online -> "Offline · ${offline.available} emails saved on this phone"
+                offline.syncing -> "Downloading mail · ${offline.complete} of ${offline.available} complete"
+                offline.error != null -> "Mail download paused · open settings to retry"
+                else -> null
+            }
+            banner?.let {
+                Text(
+                    it,
+                    style = robotoStyle(12),
+                    color = Theme.bannerText,
+                    modifier = Modifier.fillMaxWidth().background(Theme.bannerBg)
+                        .clickable { if (expired) onReauthorize() else settingsOpen = true }
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                )
+            }
+            if (mode == MailMode.Drafts || mode == MailMode.Outbox) {
+                DraftList(store, outbox = mode == MailMode.Outbox, onEdit = { composeDraftId = it })
+            } else {
+                MailList(
+                    store = store,
+                    onOpen = { readerThreadId = it.id },
+                    onSnooze = { snoozeTarget = it },
+                    onUnsubscribe = { unsubTarget = it },
+                )
+            }
         }
 
         // Compose FAB (red, 56dp, Material "add")
@@ -125,7 +177,15 @@ fun RootScreen(store: MailStore, onSignedOut: () -> Unit) {
                 .size(56.dp)
                 .shadow(6.dp, CircleShape)
                 .background(Theme.fabRed, CircleShape)
-                .clickable { composeOpen = true },
+                .clickable(enabled = !creatingDraft) {
+                    if (email.isBlank()) store.showSnack("Connect once to finish setting up your account")
+                    else scope.launch {
+                        creatingDraft = true
+                        try { composeDraftId = store.newDraft().id }
+                        catch (e: IOException) { store.showSnack(e.message ?: "Could not open a draft") }
+                        finally { creatingDraft = false }
+                    }
+                },
             contentAlignment = Alignment.Center,
         ) { MIcon("add", size = 26, color = Color.White) }
 
@@ -136,6 +196,8 @@ fun RootScreen(store: MailStore, onSignedOut: () -> Unit) {
                 mode = mode,
                 bundles = inbox.bundles,
                 inboxTotal = inbox.inboxTotal,
+                draftCount = drafts.count { it.status == DraftStatus.DRAFT },
+                outboxCount = drafts.count { it.status != DraftStatus.DRAFT },
                 onClose = { drawerOpen = false },
                 onSettings = {
                     drawerOpen = false
@@ -159,10 +221,11 @@ fun RootScreen(store: MailStore, onSignedOut: () -> Unit) {
             }
         }
 
-        if (composeOpen) ComposeScreen(store) { composeOpen = false }
+        composeDraftId?.let { id -> ComposeScreen(store, id) { composeDraftId = null } }
         if (settingsOpen) {
             SettingsScreen(
                 onClose = { settingsOpen = false },
+                onReauthorize = onReauthorize,
                 onSignedOut = {
                     settingsOpen = false
                     onSignedOut()
@@ -172,8 +235,10 @@ fun RootScreen(store: MailStore, onSignedOut: () -> Unit) {
 
         snoozeTarget?.let { t ->
             SnoozeSheet(onDismiss = { snoozeTarget = null }) { wake, desc ->
-                store.snoozeThread(t, wake, desc)
-                if (readerThreadId == t.id) readerThreadId = null
+                if (store.requireConnection()) {
+                    store.snoozeThread(t, wake, desc)
+                    if (readerThreadId == t.id) readerThreadId = null
+                }
             }
         }
 
@@ -323,6 +388,8 @@ private fun Drawer(
     mode: MailMode,
     bundles: List<com.baestheorem.inbox.gmail.BundleGroup>,
     inboxTotal: Int?,
+    draftCount: Int,
+    outboxCount: Int,
     onClose: () -> Unit,
     onSettings: () -> Unit,
 ) {
@@ -364,6 +431,14 @@ private fun Drawer(
             }
             NavRow("Sent", "send", null, mode is MailMode.Sent) {
                 store.switchMode(MailMode.Sent)
+                onClose()
+            }
+            NavRow("Drafts", "drafts", draftCount, mode is MailMode.Drafts) {
+                store.switchMode(MailMode.Drafts)
+                onClose()
+            }
+            NavRow("Outbox", "outbox", outboxCount, mode is MailMode.Outbox) {
+                store.switchMode(MailMode.Outbox)
                 onClose()
             }
             if (bundles.isNotEmpty()) {

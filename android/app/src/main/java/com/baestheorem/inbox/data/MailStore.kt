@@ -6,6 +6,7 @@ import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.baestheorem.inbox.auth.AuthStore
 import com.baestheorem.inbox.gmail.AuthExpiredException
 import com.baestheorem.inbox.gmail.Bundles
 import com.baestheorem.inbox.gmail.BundleGroup
@@ -31,11 +32,15 @@ import com.baestheorem.inbox.gmail.parseUnsubscribe
 import com.baestheorem.inbox.gmail.resolveInlineImages
 import com.baestheorem.inbox.gmail.splitQuotedHtml
 import com.baestheorem.inbox.gmail.summarize
+import com.baestheorem.inbox.work.MailWork
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -47,6 +52,8 @@ sealed class MailMode(val title: String) {
     data object Snoozed : MailMode("Snoozed")
     data object Done : MailMode("Done")
     data object Sent : MailMode("Sent")
+    data object Drafts : MailMode("Drafts")
+    data object Outbox : MailMode("Outbox")
     data class BundleFilter(val name: String) : MailMode(name)
     data class Search(val q: String) : MailMode("Search")
 }
@@ -89,20 +96,78 @@ class MailStore(app: Application) : AndroidViewModel(app) {
     private val threadCacheCap = 30
 
     val nextPageToken: String?
-        get() = if (mode.value is MailMode.Inbox) inboxNextToken else listNextToken
+        get() = if (!canAccessGmail()) null else when (mode.value) {
+            is MailMode.Inbox, is MailMode.BundleFilter -> inboxNextToken
+            is MailMode.Drafts, is MailMode.Outbox -> null
+            else -> listNextToken
+        }
+
+    init {
+        viewModelScope.launch {
+            OfflineMail.revision.collectLatest {
+                delay(500)
+                if (userEmail.value.isNotBlank() && !canAccessGmail()) {
+                    refreshLock.withLock { refreshCached() }
+                }
+            }
+        }
+        viewModelScope.launch {
+            combine(Connectivity.online, authExpired) { online, expired -> online && !expired }
+                .distinctUntilChanged().collect {
+                    if (userEmail.value.isNotBlank()) refresh()
+                }
+        }
+    }
+
+    fun canAccessGmail(): Boolean = AuthStore.isSignedIn && Connectivity.online.value && !authExpired.value
+
+    fun requireConnection(): Boolean {
+        if (canAccessGmail()) return true
+        showSnack(if (authExpired.value) "Sign in again to update Gmail" else "Connect to update Gmail")
+        return false
+    }
 
     // MARK: Lifecycle
 
     fun bootstrap() {
         viewModelScope.launch {
+            val version = AuthStore.sessionVersion
             try {
-                userEmail.value = GmailClient.profileEmail()
+                if (userEmail.value.isNotBlank() && userEmail.value != AuthStore.account) clearForSignOut()
+                userEmail.value = AuthStore.account
+                if (AuthStore.account.isNotBlank()) {
+                    OfflineMail.activate(AuthStore.account)
+                    displayName.value = withContext(Dispatchers.IO) { OfflineMail.db.displayName(AuthStore.account) }
+                    refreshLock.withLock { refreshCached() }
+                }
+                if (!canAccessGmail()) return@launch
+                val email = GmailClient.profileEmail()
+                if (version != AuthStore.sessionVersion) return@launch
+                AuthStore.account = email
+                userEmail.value = email
+                OfflineMail.activate(email)
                 displayName.value = GmailClient.displayName()
+                withContext(Dispatchers.IO) { OfflineMail.db.saveDisplayName(email, displayName.value) }
+                MailWork.schedule(ctx)
             } catch (e: IOException) {
                 Log.w("MailStore", "profile lookup failed", e)
             }
             refresh()
         }
+    }
+
+    fun clearForSignOut() {
+        inboxRows = emptyList()
+        inbox.value = InboxData()
+        listItems.value = emptyList()
+        threadCache.clear()
+        userEmail.value = ""
+        displayName.value = ""
+        inboxNextToken = null
+        listNextToken = null
+        errorText.value = null
+        mode.value = MailMode.Inbox
+        deepLinkThreadId.value = null
     }
 
     fun switchMode(newMode: MailMode) {
@@ -117,11 +182,77 @@ class MailStore(app: Application) : AndroidViewModel(app) {
     /** A caller arriving mid-refresh joins the one in flight instead of racing it. */
     suspend fun refresh() {
         refreshLock.withLock {
+            if (mode.value in setOf(MailMode.Drafts, MailMode.Outbox)) {
+                loading.value = false
+                errorText.value = null
+                return@withLock
+            }
+            if (!canAccessGmail()) {
+                refreshCached()
+                return@withLock
+            }
             when (mode.value) {
                 is MailMode.Inbox, is MailMode.BundleFilter -> refreshInbox()
                 else -> refreshList()
             }
         }
+    }
+
+    /** The offline views use the same summaries/bundles as the online inbox. */
+    private suspend fun refreshCached(): Boolean {
+        val account = AuthStore.account
+        if (account.isBlank()) return false
+        val selectedMode = mode.value
+        val snapshot = withContext(Dispatchers.IO) {
+            if (OfflineMail.db.owner() != MailDatabase.normalize(account)) return@withContext null
+            val messages = OfflineMail.db.messages(
+                account, OfflinePolicy.cutoff(System.currentTimeMillis()), withBodies = selectedMode is MailMode.Search,
+            )
+            messages to OfflineMail.db.labels(account)
+        } ?: return false
+        if (selectedMode != mode.value || account != AuthStore.account) return false
+        val (all, labels) = snapshot
+        bundleOverrides = labels.mapNotNull { l ->
+            l.name?.takeIf { it.startsWith("Bundle/") }?.let { l.id to it.removePrefix("Bundle/") }
+        }.toMap()
+        val snoozedLabel = labels.firstOrNull { it.name == "Snoozed" }?.id
+        val selected = when (selectedMode) {
+            is MailMode.Inbox, is MailMode.BundleFilter -> all.filter { "INBOX" in it.labelIds }
+            is MailMode.Sent -> all.filter { "SENT" in it.labelIds }
+            is MailMode.Snoozed -> all.filter { snoozedLabel != null && snoozedLabel in it.labelIds }
+            is MailMode.Done -> all.filter { "INBOX" !in it.labelIds && "SENT" !in it.labelIds }
+            is MailMode.Search -> {
+                val terms = selectedMode.q.lowercase().split(Regex("\\s+")).filter { it.isNotBlank() }
+                all.filter { m ->
+                    val text = buildString {
+                        append(m.snippet).append(' ')
+                        m.payload?.headers?.forEach { append(it.value).append(' ') }
+                        append(decodeBody(m.payload).text)
+                    }.lowercase()
+                    terms.all { it in text }
+                }
+            }
+            else -> emptyList()
+        }
+        var rows = withContext(Dispatchers.Default) {
+            summarize(selected, bundleOverrides, selectedMode is MailMode.Sent)
+        }
+        rows = applyBodyUnsub(rows, mutableListOf())
+        inboxNextToken = null
+        listNextToken = null
+        if (selectedMode is MailMode.Inbox || selectedMode is MailMode.BundleFilter) {
+            inboxRows = rows
+            inbox.value = inbox.value.copy(
+                inboxTotal = rows.size, inboxUnread = rows.count { it.unread },
+            )
+            partition()
+        } else {
+            listItems.value = if (selectedMode is MailMode.Snoozed) rows.map { it.copy(wake = SnoozeStore.wake(it.id)) }
+            else rows
+        }
+        loading.value = false
+        errorText.value = null
+        return all.isNotEmpty()
     }
 
     fun refreshAsync() {
@@ -171,14 +302,14 @@ class MailStore(app: Application) : AndroidViewModel(app) {
             Prefs.noteSeenUnread(msgs.filter { "UNREAD" in it.labelIds }.map { it.id })
             errorText.value = null
         } catch (e: IOException) {
-            errorText.value = friendly(e)
+            if (!refreshCached()) errorText.value = friendly(e)
         } finally {
             loading.value = false
         }
     }
 
     fun loadMore() {
-        if (loadingMore) return
+        if (loadingMore || !canAccessGmail()) return
         loadingMore = true
         viewModelScope.launch {
             try {
@@ -286,7 +417,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
             scanBodies(missing)
             errorText.value = null
         } catch (e: IOException) {
-            errorText.value = friendly(e)
+            if (!refreshCached()) errorText.value = friendly(e)
         } finally {
             loading.value = false
         }
@@ -321,7 +452,11 @@ class MailStore(app: Application) : AndroidViewModel(app) {
             var found = false
             for (mid in fresh) {
                 val html = GmailClient.messageBodyHtml(mid)
-                val info = html?.let { findBodyUnsubscribe(it) }
+                if (html == null) {
+                    UnsubScanCache.release(mid)
+                    continue
+                }
+                val info = findBodyUnsubscribe(html)
                 UnsubScanCache.put(mid, info?.httpsUrl ?: "")
                 if (info != null) found = true
                 delay(250) // gentle on the quota
@@ -414,6 +549,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
     // MARK: Actions (optimistic, with undo)
 
     fun markDone(t: ThreadSummary) {
+        if (!requireConnection()) return
         removeEverywhere(t.id)
         viewModelScope.launch {
             try {
@@ -431,6 +567,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
 
     /** The Done view's "move back to inbox". */
     fun restoreToInbox(t: ThreadSummary) {
+        if (!requireConnection()) return
         removeEverywhere(t.id)
         viewModelScope.launch {
             try {
@@ -444,6 +581,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
     }
 
     fun togglePin(t: ThreadSummary) {
+        if (!requireConnection()) return
         val newVal = !t.pinned
         mutateEverywhere(t.id) { it.copy(pinned = newVal) }
         viewModelScope.launch {
@@ -461,6 +599,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
     }
 
     fun snoozeThread(t: ThreadSummary, wake: Long, desc: String) {
+        if (!requireConnection()) return
         removeEverywhere(t.id)
         viewModelScope.launch {
             try {
@@ -486,6 +625,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
     }
 
     fun unsnooze(t: ThreadSummary) {
+        if (!requireConnection()) return
         removeEverywhere(t.id)
         viewModelScope.launch {
             try {
@@ -501,6 +641,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
     }
 
     fun spam(t: ThreadSummary) {
+        if (!requireConnection()) return
         removeEverywhere(t.id)
         viewModelScope.launch {
             try {
@@ -520,6 +661,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
     }
 
     fun toggleUnread(t: ThreadSummary) {
+        if (!requireConnection()) return
         val newUnread = !t.unread
         mutateEverywhere(t.id) { it.copy(unread = newUnread) }
         viewModelScope.launch {
@@ -535,10 +677,13 @@ class MailStore(app: Application) : AndroidViewModel(app) {
 
     fun markReadLocally(threadId: String) {
         mutateEverywhere(threadId) { it.copy(unread = false) }
-        viewModelScope.launch { runCatching { GmailClient.modifyThread(threadId, remove = listOf("UNREAD")) } }
+        if (canAccessGmail()) {
+            viewModelScope.launch { runCatching { GmailClient.modifyThread(threadId, remove = listOf("UNREAD")) } }
+        }
     }
 
     fun sweep(b: BundleGroup) {
+        if (!requireConnection()) return
         val items = b.items
         for (r in items) removeEverywhere(r.id)
         viewModelScope.launch {
@@ -588,6 +733,15 @@ class MailStore(app: Application) : AndroidViewModel(app) {
     // MARK: Reader
 
     suspend fun loadThread(threadId: String): ThreadDetail {
+        val account = AuthStore.account
+        val cached = withContext(Dispatchers.IO) {
+            if (account.isBlank() || OfflineMail.db.owner() != MailDatabase.normalize(account)) null
+            else OfflineMail.db.thread(account, threadId, OfflinePolicy.cutoff(System.currentTimeMillis()))
+        }
+        if (!canAccessGmail()) {
+            val thread = cached ?: throw IOException("This email has not downloaded yet. Connect to download it.")
+            return withContext(Dispatchers.Default) { parseThread(thread, threadId).detail }
+        }
         val row = inboxRows.firstOrNull { it.id == threadId }
             ?: listItems.value.firstOrNull { it.id == threadId }
         threadCache[threadId]?.let { c ->
@@ -599,10 +753,43 @@ class MailStore(app: Application) : AndroidViewModel(app) {
             }
             threadCache.remove(threadId)
         }
-        val th = GmailClient.getThread(threadId)
+        val th = try {
+            GmailClient.getThread(threadId)
+        } catch (e: IOException) {
+            cached ?: throw e
+        }
+        if (account != AuthStore.account) throw AccountChangedException()
+        // Store text immediately; the resumable worker finishes any attachments.
+        if (account.isNotBlank()) OfflineMail.cacheOpenedThread(account, th)
+        val readable = withContext(Dispatchers.IO) {
+            th.copy(messages = th.messages.map { message ->
+                val full = if (message.payload?.body?.data == null &&
+                    OfflinePolicy.attachmentIds(message.payload).isNotEmpty()) {
+                    val bytes = mutableMapOf<String, ByteArray>()
+                    fun textParts(part: com.baestheorem.inbox.gmail.GPayload?) {
+                        if (part == null) return
+                        if (part.mimeType in setOf("text/plain", "text/html") && part.filename.isNullOrEmpty()) {
+                            part.body?.attachmentId?.let { bytes[it] = byteArrayOf() }
+                        }
+                        part.parts.forEach(::textParts)
+                    }
+                    textParts(message.payload)
+                    for (aid in bytes.keys.toList()) bytes[aid] = GmailClient.attachmentData(message.id, aid)
+                    message.copy(payload = OfflinePolicy.hydrateTextParts(message.payload, bytes))
+                } else message
+                if (full != message && account.isNotBlank() &&
+                    OfflinePolicy.includes(full, OfflinePolicy.cutoff(System.currentTimeMillis()))) {
+                    OfflineMail.db.putMessage(account, full)
+                    if (OfflinePolicy.attachmentIds(full.payload).all { OfflineMail.db.attachment(account, full.id, it) != null }) {
+                        OfflineMail.db.markComplete(account, full.id)
+                    }
+                }
+                full
+            })
+        }
         // Base64 body decode plus the quote-split and unsubscribe regexes over a
         // big newsletter is real CPU; parse off the main thread.
-        val parsed = withContext(Dispatchers.Default) { parseThread(th, threadId) }
+        val parsed = withContext(Dispatchers.Default) { parseThread(readable, threadId) }
         parsed.bodyUnsubHit?.let { (mid, url) -> UnsubScanCache.put(mid, url) }
         if (row?.unread != false) markReadLocally(threadId)
         val lastMid = parsed.detail.messages.lastOrNull()?.id ?: ""
@@ -702,27 +889,23 @@ class MailStore(app: Application) : AndroidViewModel(app) {
 
     fun replyAllAvailable(d: ThreadDetail): Boolean = replyRecipients(d, true).second.isNotEmpty()
 
-    suspend fun sendReply(detail: ThreadDetail, body: String, replyAll: Boolean) {
-        val (to, cc) = replyRecipients(detail, replyAll)
-        if (to.isEmpty()) throw GmailException(0, "no recipient")
-        val subj = if (detail.subject.lowercase().startsWith("re:")) detail.subject
-        else "Re: " + detail.subject
-        val raw = buildRawMessage(
-            to = to, cc = cc.ifEmpty { null }, subject = subj, body = body,
-            fromName = displayName.value, fromEmail = userEmail.value,
-            inReplyTo = detail.rfcMessageId, references = detail.allRfcIds.joinToString(" "),
-        )
-        GmailClient.send(raw, detail.id)
+    suspend fun newDraft(): LocalDraft {
+        val draft = LocalDraft(account = AuthStore.account, fromName = displayName.value)
+        return OfflineMail.save(draft).await()
     }
 
-    suspend fun sendNew(to: String, subject: String, body: String) {
-        val raw = buildRawMessage(
-            to = to, cc = null, subject = subject, body = body,
-            fromName = displayName.value, fromEmail = userEmail.value,
-            inReplyTo = null, references = null,
+    fun replyTemplate(detail: ThreadDetail, replyAll: Boolean): LocalDraft {
+        val (to, cc) = replyRecipients(detail, replyAll)
+        return LocalDraft(
+            account = AuthStore.account, to = to, cc = cc,
+            subject = if (detail.subject.startsWith("re:", true)) detail.subject else "Re: ${detail.subject}",
+            fromName = displayName.value, threadId = detail.id,
+            inReplyTo = detail.rfcMessageId, references = detail.allRfcIds.joinToString(" "),
         )
-        GmailClient.send(raw, null)
     }
+
+    suspend fun loadReplyDraft(detail: ThreadDetail): LocalDraft =
+        OfflineMail.replyDraft(detail.id).await() ?: replyTemplate(detail, false)
 
     // MARK: Unsubscribe (RFC 2369 / RFC 8058, port of api_unsubscribe)
 
@@ -734,6 +917,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
     //   5. the List-Unsubscribe mailto
     //   6. the browser, and only once every one of those has failed
     fun unsubscribe(info: UnsubInfo, sender: String) {
+        if (!requireConnection()) return
         viewModelScope.launch {
             showSnack("Unsubscribing from $sender…")
             val url = info.httpsUrl

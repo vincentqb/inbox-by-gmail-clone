@@ -1,6 +1,6 @@
 package com.baestheorem.inbox.gmail
 
-import android.util.Base64
+import java.util.Base64
 import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalDateTime
@@ -81,7 +81,7 @@ fun pct(s: String): String {
 }
 
 fun base64UrlDecode(s: String): ByteArray? = try {
-    Base64.decode(s, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+    Base64.getUrlDecoder().decode(s)
 } catch (e: IllegalArgumentException) {
     null
 }
