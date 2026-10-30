@@ -1,5 +1,6 @@
 package com.baestheorem.inbox.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -19,6 +20,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -38,18 +41,71 @@ import androidx.compose.ui.unit.dp
 import com.baestheorem.inbox.auth.AuthStore
 import com.baestheorem.inbox.auth.OAuthFlow
 import com.baestheorem.inbox.data.Prefs
+import com.baestheorem.inbox.data.OfflineMail
+import com.baestheorem.inbox.data.DraftStatus
+import com.baestheorem.inbox.data.Connectivity
+import com.baestheorem.inbox.gmail.GmailClient
 import com.baestheorem.inbox.data.SwipeActionKind
 import com.baestheorem.inbox.data.SwipeConfig
 import com.baestheorem.inbox.data.SwipeSlot
 import com.baestheorem.inbox.work.NewMailWorker
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
+import java.text.DateFormat
+import java.util.Date
 
 @Composable
-fun SettingsScreen(onClose: () -> Unit, onSignedOut: () -> Unit) {
+fun SettingsScreen(onClose: () -> Unit, onSignedOut: () -> Unit, onReauthorize: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val slots by SwipeConfig.slots.collectAsState()
+    val offline by OfflineMail.status.collectAsState()
+    val drafts by OfflineMail.drafts.collectAsState()
+    val online by Connectivity.online.collectAsState()
+    val expired by GmailClient.authExpired.collectAsState()
     var notify by remember { mutableStateOf(Prefs.notifyNewMail) }
+    var resetRequested by remember { mutableStateOf<Boolean?>(null) }
+    var clearing by remember { mutableStateOf(false) }
+    BackHandler { if (!clearing) onClose() }
+
+    resetRequested?.let { reset ->
+        AlertDialog(
+            onDismissRequest = { resetRequested = null },
+            title = { Text(if (reset) "Reset setup?" else "Sign out?") },
+            text = {
+                val unsent = drafts.count { it.status != DraftStatus.SENT }
+                Text(
+                    "This removes downloaded mail and $unsent local drafts or queued messages from this phone. " +
+                        "Mail already in Gmail stays there.",
+                    style = robotoStyle(14),
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    resetRequested = null
+                    clearing = true
+                    val token = AuthStore.refreshToken
+                    if (reset) AuthStore.forgetEverything() else AuthStore.signOut()
+                    NewMailWorker.cancel(context)
+                    scope.launch {
+                        withContext(NonCancellable) {
+                            try {
+                                OfflineMail.clear()
+                                GmailClient.resetForNewAccount()
+                            } finally {
+                                onSignedOut()
+                            }
+                        }
+                    }
+                    OfflineMail.scope.launch { OAuthFlow.revoke(token) }
+                }) { Text(if (reset) "Reset" else "Sign out", color = Theme.fabRed) }
+            },
+            dismissButton = {
+                TextButton(onClick = { resetRequested = null }) { Text("Keep local mail") }
+            },
+        )
+    }
 
     Column(Modifier.fillMaxSize().background(Theme.cardBg).statusBarsPadding()) {
         Row(
@@ -58,7 +114,7 @@ fun SettingsScreen(onClose: () -> Unit, onSignedOut: () -> Unit) {
         ) {
             Text("Settings", style = robotoStyle(16, FontWeight.Medium), color = Theme.textPrimary)
             Spacer(Modifier.weight(1f))
-            Box(Modifier.size(40.dp).clickable(onClick = onClose), Alignment.Center) {
+            Box(Modifier.size(40.dp).clickable(enabled = !clearing, onClick = onClose), Alignment.Center) {
                 MIcon("close", size = 20)
             }
         }
@@ -90,32 +146,50 @@ fun SettingsScreen(onClose: () -> Unit, onSignedOut: () -> Unit) {
                     "Sign out",
                     style = robotoStyle(14, FontWeight.Medium),
                     color = Theme.fabRed,
-                    modifier = Modifier.clickable {
-                        val token = AuthStore.refreshToken
-                        scope.launch {
-                            OAuthFlow.revoke(token)
-                            AuthStore.signOut()
-                            NewMailWorker.cancel(context)
-                            onSignedOut()
-                        }
-                    },
+                    modifier = Modifier.clickable(enabled = !clearing) { resetRequested = false },
                 )
                 Spacer(Modifier.width(24.dp))
                 Text(
                     "Reset setup",
                     style = robotoStyle(14, FontWeight.Medium),
                     color = Theme.textSecondary,
-                    modifier = Modifier.clickable {
-                        val token = AuthStore.refreshToken
-                        scope.launch {
-                            OAuthFlow.revoke(token)
-                            AuthStore.forgetEverything()
-                            NewMailWorker.cancel(context)
-                            onSignedOut()
-                        }
-                    },
+                    modifier = Modifier.clickable(enabled = !clearing) { resetRequested = true },
                 )
             }
+
+            SectionLabel("Offline mail")
+            Text(
+                "${offline.available} emails saved · ${offline.complete} fully downloaded",
+                style = robotoStyle(15), color = Theme.textPrimary,
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
+            Text(
+                "Automatically downloads the last two calendar months, including attachments. " +
+                    "Downloads and queued sends continue in the background when connected, using Wi-Fi or mobile data. " +
+                    "Drafts are saved on this phone.",
+                style = robotoStyle(12), color = Theme.textSecondary,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            )
+            Text(
+                when {
+                    expired -> "Google sign-in expired. Downloaded mail and local drafts are still available."
+                    !online -> "Offline. Downloads and queued sends resume after reconnecting."
+                    offline.syncing -> "Downloading…"
+                    offline.error != null -> offline.error ?: ""
+                    offline.lastSync > 0 -> "Last completed sync: " +
+                        DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(offline.lastSync))
+                    else -> "Waiting for the first download."
+                },
+                style = robotoStyle(12), color = Theme.textSecondary,
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
+            Text(
+                if (expired) "Sign in again" else "Sync now",
+                style = robotoStyle(14, FontWeight.Medium), color = Theme.blue,
+                modifier = Modifier.clickable(enabled = !clearing) {
+                    if (expired) onReauthorize() else OfflineMail.syncNow()
+                }.padding(horizontal = 16.dp, vertical = 14.dp),
+            )
 
             SectionLabel("Notifications")
             Row(
@@ -136,8 +210,8 @@ fun SettingsScreen(onClose: () -> Unit, onSignedOut: () -> Unit) {
             }
             Text(
                 "Android wakes background work about every 15 minutes, so a banner can " +
-                    "land a few minutes after the mail does. Snoozed threads always come " +
-                    "back on time.",
+                    "land a few minutes after the mail does. Android battery restrictions " +
+                    "can delay background downloads, sends, and snoozed threads.",
                 style = robotoStyle(12),
                 color = Theme.textSecondary,
                 modifier = Modifier.padding(horizontal = 16.dp),

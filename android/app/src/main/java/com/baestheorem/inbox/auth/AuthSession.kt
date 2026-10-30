@@ -67,6 +67,9 @@ object AuthSession {
             _state.value = State.Waiting(s.authUrl)
             try {
                 val tokens = s.awaitTokens()
+                // Until profile lookup identifies this grant, background work
+                // must not pair the new token with the previous account.
+                AuthStore.account = ""
                 AuthStore.refreshToken = tokens.refreshToken
                 GmailClient.resetForNewAccount()
                 // The grant is already stored, so a flaky profile lookup must

@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -18,6 +19,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
@@ -25,6 +27,8 @@ import androidx.core.view.WindowCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.baestheorem.inbox.auth.AuthStore
+import com.baestheorem.inbox.auth.AuthSession
+import com.baestheorem.inbox.data.Connectivity
 import com.baestheorem.inbox.data.MailStore
 import com.baestheorem.inbox.data.Prefs
 import com.baestheorem.inbox.data.SnoozeStore
@@ -32,7 +36,9 @@ import com.baestheorem.inbox.ui.RootScreen
 import com.baestheorem.inbox.ui.SetupWizard
 import com.baestheorem.inbox.ui.Theme
 import com.baestheorem.inbox.work.NewMailWorker
+import com.baestheorem.inbox.work.MailWork
 import kotlinx.coroutines.launch
+import java.io.IOException
 
 class MainActivity : ComponentActivity() {
     private var pendingThreadId: String? = null
@@ -75,9 +81,16 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         if (!AuthStore.isSignedIn) return
         lifecycleScope.launch {
-            val woken = SnoozeStore.processDue()
             val s = store ?: return@launch
-            if (woken > 0) s.refresh()
+            MailWork.sync(this@MainActivity)
+            MailWork.send(this@MainActivity)
+            if (s.canAccessGmail()) {
+                try {
+                    if (SnoozeStore.processDue() > 0) s.refresh()
+                } catch (e: IOException) {
+                    // A reconnect or a later background run will try again.
+                }
+            }
         }
     }
 
@@ -100,13 +113,13 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun App(onStoreReady: (MailStore) -> Unit, onSignedIn: () -> Unit) {
     var signedIn by remember { mutableStateOf(AuthStore.isSignedIn) }
+    var reauthorize by rememberSaveable { mutableStateOf(false) }
+    val store: MailStore = viewModel()
+    val context = androidx.compose.ui.platform.LocalContext.current
     if (!signedIn) {
-        SetupWizard(onDone = { signedIn = true })
+        SetupWizard(onDone = { signedIn = AuthStore.isSignedIn })
         return
     }
-    val store: MailStore = viewModel()
-    val expired by store.authExpired.collectAsState()
-    val context = androidx.compose.ui.platform.LocalContext.current
 
     LaunchedEffect(Unit) {
         onStoreReady(store)
@@ -115,12 +128,30 @@ private fun App(onStoreReady: (MailStore) -> Unit, onSignedIn: () -> Unit) {
         store.bootstrap()
     }
 
-    if (expired) {
-        // The refresh token died (revoked, or the 7-day Testing expiry); the
-        // wizard puts it back without touching the client credentials.
-        SetupWizard(onDone = { })
-        return
+    RootScreen(
+        store = store,
+        onSignedOut = {
+            store.clearForSignOut()
+            signedIn = false
+            reauthorize = false
+            AuthSession.cancel()
+        },
+        onReauthorize = {
+            AuthSession.consume()
+            reauthorize = true
+        },
+    )
+    if (reauthorize) {
+        // Keep the reader/editor alive beneath sign-in, so token expiry does
+        // not take away downloaded mail or a reply the user is writing.
+        SetupWizard(onDone = {
+            reauthorize = false
+            store.bootstrap()
+            MailWork.schedule(context)
+        })
+        BackHandler {
+            AuthSession.cancel()
+            reauthorize = false
+        }
     }
-
-    RootScreen(store = store, onSignedOut = { signedIn = AuthStore.isSignedIn })
 }

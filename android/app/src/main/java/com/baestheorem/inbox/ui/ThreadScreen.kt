@@ -7,6 +7,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -56,6 +57,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.FileProvider
 import com.baestheorem.inbox.data.MailStore
+import com.baestheorem.inbox.data.LocalDraft
+import com.baestheorem.inbox.data.OfflineMail
 import com.baestheorem.inbox.gmail.ATTACH_HOST
 import com.baestheorem.inbox.gmail.ORIGINAL_HOST
 import com.baestheorem.inbox.gmail.CID_HOST
@@ -84,8 +87,11 @@ fun ThreadScreen(
     val scope = rememberCoroutineScope()
     var detail by remember(threadId) { mutableStateOf<ThreadDetail?>(null) }
     var pinned by remember(threadId) { mutableStateOf(false) }
-    var replyText by remember(threadId) { mutableStateOf("") }
+    var replyDraft by remember(threadId) { mutableStateOf<LocalDraft?>(null) }
     var replyAll by remember(threadId) { mutableStateOf(false) }
+    var replyEdited by remember(threadId) { mutableStateOf(false) }
+    var saveState by remember(threadId) { mutableStateOf("") }
+    var editVersion by remember(threadId) { mutableStateOf(0) }
     var sending by remember { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
     var confirmUnsub by remember { mutableStateOf(false) }
@@ -96,11 +102,52 @@ fun ThreadScreen(
             val d = store.loadThread(threadId)
             detail = d
             pinned = d.pinned
+            val saved = store.loadReplyDraft(d)
+            replyDraft = saved
+            replyAll = saved.cc.isNotBlank()
+            replyEdited = saved.body.isNotEmpty()
+            if (replyEdited) saveState = "Saved on this phone"
         } catch (e: IOException) {
-            store.showSnack("Couldn't load thread (${store.shortError(e)})")
+            store.showSnack(e.message ?: "Couldn't load thread")
             onClose()
         }
     }
+
+    fun saveReply(next: LocalDraft) {
+        replyDraft = next
+        replyEdited = true
+        editVersion++
+        val version = editVersion
+        saveState = "Saving…"
+        val pending = OfflineMail.save(next)
+        scope.launch {
+            try {
+                pending.await()
+                if (version == editVersion) saveState = "Saved on this phone"
+            } catch (e: IOException) {
+                if (version == editVersion) saveState = "Couldn't save. Tap Save draft to retry."
+            }
+        }
+    }
+
+    fun saveAndClose() {
+        if (sending) return
+        val draft = replyDraft
+        if (!replyEdited || draft == null) return onClose()
+        sending = true
+        val pending = OfflineMail.save(draft)
+        scope.launch {
+            try {
+                pending.await()
+                onClose()
+            } catch (e: IOException) {
+                sending = false
+                saveState = "Couldn't save. Tap Save draft to retry."
+                store.showSnack("Couldn't save reply: ${e.message}")
+            }
+        }
+    }
+    BackHandler(onBack = ::saveAndClose)
 
     // Reader actions need a list-row shape; build one from what the reader knows.
     fun stub(): ThreadSummary = ThreadSummary(
@@ -129,7 +176,7 @@ fun ThreadScreen(
                 .padding(horizontal = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            BarIcon("arrow_back") { onClose() }
+            BarIcon("arrow_back") { saveAndClose() }
             Text(
                 detail?.subject ?: "",
                 style = robotoStyle(17),
@@ -139,20 +186,23 @@ fun ThreadScreen(
                 modifier = Modifier.weight(1f).padding(start = 4.dp),
             )
             BarIcon("push_pin", if (pinned) Theme.pinYellow else Theme.textSecondary) {
-                // togglePin flips from the row it is handed, so pass the pre-toggle state
-                store.togglePin(stub().copy(pinned = pinned))
-                pinned = !pinned
+                if (store.requireConnection()) {
+                    store.togglePin(stub().copy(pinned = pinned))
+                    pinned = !pinned
+                }
             }
             BarIcon("playlist_add_check", Theme.doneGreen) {
-                store.markDone(stub())
-                onClose()
+                if (store.requireConnection()) {
+                    store.markDone(stub())
+                    saveAndClose()
+                }
             }
             Box {
                 BarIcon("more_vert") { menuOpen = true }
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                     MenuRow("Snooze", "schedule") {
                         menuOpen = false
-                        onSnooze(stub())
+                        if (store.requireConnection()) onSnooze(stub())
                     }
                     MenuRow("Share", "send") {
                         menuOpen = false
@@ -160,13 +210,17 @@ fun ThreadScreen(
                     }
                     MenuRow("Mark unread", "markunread") {
                         menuOpen = false
-                        store.toggleUnread(stub().copy(unread = false))
-                        onClose()
+                        if (store.requireConnection()) {
+                            store.toggleUnread(stub().copy(unread = false))
+                            saveAndClose()
+                        }
                     }
                     MenuRow("Report spam", "report") {
                         menuOpen = false
-                        store.spam(stub())
-                        onClose()
+                        if (store.requireConnection()) {
+                            store.spam(stub())
+                            saveAndClose()
+                        }
                     }
                     MenuRow("Open in Gmail", "open_in_new") {
                         menuOpen = false
@@ -186,21 +240,35 @@ fun ThreadScreen(
             ReplyBar(
                 store = store,
                 detail = d,
-                text = replyText,
-                onText = { replyText = it },
+                text = replyDraft?.body.orEmpty(),
+                onText = { text -> replyDraft?.let { saveReply(it.copy(body = text)) } },
                 replyAll = replyAll,
-                onToggleReplyAll = { replyAll = !replyAll },
+                onToggleReplyAll = {
+                    replyAll = !replyAll
+                    val template = store.replyTemplate(d, replyAll)
+                    replyDraft?.let {
+                        val next = it.copy(to = template.to, cc = template.cc)
+                        if (replyEdited) saveReply(next) else replyDraft = next
+                    }
+                },
+                ready = replyDraft != null,
                 sending = sending,
+                saveState = saveState,
+                onSave = ::saveAndClose,
                 onSend = {
-                    val body = replyText
+                    val draft = replyDraft ?: return@ReplyBar
                     sending = true
+                    val pending = OfflineMail.queue(draft)
                     scope.launch {
                         try {
-                            store.sendReply(d, body, replyAll)
-                            replyText = ""
-                            store.showSnack("Sent")
+                            pending.await()
+                            editVersion++
+                            replyDraft = store.replyTemplate(d, replyAll)
+                            replyEdited = false
+                            saveState = ""
+                            store.showSnack("Queued in Outbox")
                         } catch (e: IOException) {
-                            store.showSnack("Send failed")
+                            store.showSnack("Couldn't queue reply: ${e.message}")
                         }
                         sending = false
                     }
@@ -295,19 +363,29 @@ private fun ReplyBar(
     onText: (String) -> Unit,
     replyAll: Boolean,
     onToggleReplyAll: () -> Unit,
+    ready: Boolean,
     sending: Boolean,
+    saveState: String,
+    onSave: () -> Unit,
     onSend: () -> Unit,
 ) {
-    val canSend = text.isNotBlank() && !sending
+    val canSend = ready && text.isNotBlank() && !sending
     Column(Modifier.background(Theme.cardBg).imePadding().navigationBarsPadding()) {
         Box(Modifier.fillMaxWidth().height(1.dp).background(Theme.divider))
+        if (saveState.isNotBlank()) {
+            Row(Modifier.fillMaxWidth().padding(start = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(saveState, style = robotoStyle(12), color = Theme.textSecondary, modifier = Modifier.weight(1f))
+                TextButton(enabled = !sending, onClick = onSave) { Text("Save draft", color = Theme.blue) }
+            }
+        }
         Row(
             Modifier.fillMaxWidth().padding(12.dp),
             verticalAlignment = Alignment.Bottom,
         ) {
             if (store.replyAllAvailable(detail)) {
                 Box(
-                    Modifier.size(width = 36.dp, height = 44.dp).clickable(onClick = onToggleReplyAll),
+                    Modifier.size(width = 36.dp, height = 44.dp)
+                        .clickable(enabled = ready && !sending, onClick = onToggleReplyAll),
                     contentAlignment = Alignment.Center,
                 ) {
                     MIcon("people", size = 20, color = if (replyAll) Theme.blue else Theme.textSecondary)
@@ -324,6 +402,7 @@ private fun ReplyBar(
                 BasicTextField(
                     value = text,
                     onValueChange = onText,
+                    enabled = ready && !sending,
                     textStyle = robotoStyle(14).copy(color = Theme.textPrimary),
                     cursorBrush = SolidColor(Theme.blue),
                     modifier = Modifier.fillMaxWidth(),
@@ -392,7 +471,7 @@ private fun ThreadWebView(store: MailStore, detail: ThreadDetail, onOriginal: (S
                         // tells the sender nothing.
                         val data = runBlocking {
                             runCatching { GmailClient.attachmentData(parts[0], parts[1]) }.getOrNull()
-                        } ?: return null
+                        } ?: byteArrayOf()
                         return WebResourceResponse(mime, null, ByteArrayInputStream(data))
                     }
 

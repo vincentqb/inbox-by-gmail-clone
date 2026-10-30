@@ -60,11 +60,75 @@ client is rejected by the wizard, because its redirect rules do not fit.
 
 A Cloud project whose consent screen is **External** and whose publishing status
 is still **Testing** gets refresh tokens that expire after 7 days ([Google's
-docs](https://developers.google.com/identity/protocols/oauth2#expiration)). The
-app notices (`invalid_grant`) and drops back into the wizard to sign in again.
-Press **Publish app** on the console's Audience page and it stops happening.
+docs](https://developers.google.com/identity/protocols/oauth2#expiration)).
+The app notices (`invalid_grant`) and offers **Sign in again**, while keeping
+downloaded mail and local drafts available. Publishing the consent screen to
+**Production** removes this Testing-specific expiry; Google can still revoke
+tokens for other reasons. Publishing is separate from Google's verification
+process and from building the release APK.
 
-## In v1
+### Which credential to get from Google Cloud
+
+Create a Google Cloud project, enable **Gmail API**, configure **Google Auth
+Platform → Branding / Audience**, and add your Gmail address as a test user
+while the app is in Testing. Under **Clients**, create an OAuth client with
+application type **Desktop app** and download its client JSON.
+
+Paste that JSON into the phone's setup wizard, then complete **Sign in with
+Google** in the browser. The app obtains and refreshes the account's OAuth
+tokens itself. A Google Cloud **API key** does not grant access to private Gmail;
+you do not need to obtain or paste a short-lived access token manually.
+
+## Offline mail, drafts, and Outbox
+
+On sign-in, the Android app automatically downloads a rolling two-month window
+of email. It uses UTC calendar-month arithmetic: on October 30, the window
+starts on August 30 at the same UTC time. It includes Inbox, Sent, archived,
+and snoozed mail, and excludes Spam, Trash, Gmail Drafts, and Chats.
+
+Full message bodies, MIME inline images, and attachments are saved in the app's
+private storage. Downloads resume from a durable checkpoint after a connection
+failure or process restart. Gmail history updates keep the cache current, a
+daily inventory checks for missed changes, and older mail is removed from the
+downloaded window. **Settings → Offline mail** shows saved and fully downloaded
+counts and offers **Sync now**. Let the first download finish while connected
+before relying on airplane mode; a saved body may become readable before its
+attachments finish downloading.
+
+While offline, you can read downloaded threads and open downloaded attachments
+in Inbox, Done, Sent, and Snoozed. Offline search matches ordinary words against
+cached subjects, senders, previews, and text bodies; Gmail query operators work
+when connected. Earlier messages in a conversation, externally hosted images,
+**Show original**, and Gmail changes such as archive, pin, snooze, or unsubscribe
+require a connection.
+
+Compose and reply/reply-all save typed changes locally. **Save draft** finishes
+the save before closing; the **Drafts** drawer entry lets you reopen it after
+closing or restarting the app. These drafts live on this phone and are not
+synced to Gmail's Drafts folder or another device. Discarding a draft requires
+confirmation.
+
+**Send** saves a frozen copy in **Outbox**, including its recipients, reply
+thread, and a stable Message-ID. The app delivers it when Gmail is reachable,
+including after the app has closed. Queued and rejected messages can be
+returned to Drafts for editing; sent items disappear from Outbox.
+
+Gmail does not provide an idempotent send API. If a connection fails after a
+send might have reached Gmail, the app searches Sent for the Message-ID and
+shows **Delivery unconfirmed** until delivery can be established. It never repeats
+that uncertain send automatically. **Retry** checks Sent again and asks
+for confirmation when delivery is uncertain, because a manual retry could
+produce a duplicate.
+
+Download and Outbox workers run independently of the notification switch, use
+Wi-Fi or mobile data, and run periodically at Android's 15-minute minimum.
+Reopening the app or reconnecting also schedules work. Android battery
+restrictions can delay it; after a force-stop, open the app to resume.
+Signing out, resetting setup, uninstalling, or switching Gmail accounts removes
+the phone's downloaded mail and local drafts/Outbox. Signing out and resetting
+show the number of unsent items before clearing them.
+
+## Features
 
 - Inbox with Bundles (the same keyword classifier plus `Bundle/<name>` label
   overrides), pinned shortlist merged into page one, IMPORTANT+unread float,
@@ -88,8 +152,9 @@ Press **Publish app** on the console's Audience page and it stops happening.
   port of `message_details`.
 - Reply and reply-all (never addressed to yourself), compose, threaded with
   In-Reply-To/References, sent as your display name
-- Snoozed / Done / Sent views, Gmail-syntax search, pull to refresh, infinite
-  scroll, the pinned-only app-bar switch, undo snackbar
+- Snoozed / Done / Sent views, Gmail-syntax search when connected, local search
+  offline, pull to refresh, infinite scroll, the pinned-only app-bar switch,
+  undo snackbar, plus local Drafts and Outbox
 - Bundle sweep two ways: the `done_all` button in the bundle head, or swipe the
   bundle card right
 - **Unsubscribe** (RFC 2369 / RFC 8058): an inline link on the card, a banner in
@@ -121,36 +186,74 @@ Press **Publish app** on the console's Audience page and it stops happening.
 
 ## Not ported
 
-Block sender, move-to-bundle filters, drafts, aliases, multi-select, undo send,
+Block sender, move-to-bundle filters, aliases, multi-select, undo send,
 live SSE. **Send to Things 3** is Apple-only, so the same slot is a share
 intent: it hands any task app the subject, the `inboxclone://` backlink and the
 Gmail permalink.
 
 ## Build
 
-Needs a JDK 17 and the Android SDK (`brew install --cask temurin@17` or
-`brew install openjdk@17`, plus `brew install android-commandlinetools`). Point
-`android/local.properties` at the SDK, then:
+Needs **JDK 17**, the Android SDK with **platforms;android-34** and
+**build-tools;34.0.0**, and platform-tools for USB installation. Android Studio's
+SDK Manager can install these. On macOS, JDK 17 is also available with
+`brew install --cask temurin@17` or `brew install openjdk@17`.
 
-    ./scripts/build-apk.sh
+From the repository root, with your own JDK and SDK paths:
+
+```sh
+export JAVA_HOME=/path/to/jdk-17
+export ANDROID_HOME=/path/to/android-sdk
+./android/scripts/build-apk.sh
+```
 
 It creates `keystore/inbox-release.jks` on first run (gitignored, and worth
-backing up: without it a later APK cannot upgrade an installed one), builds the
-release variant, and prints the path, the signing fingerprints and the sha256 of
-`build/Inbox.apk`.
+backing up together with `android/keystore.properties`: later APKs need that
+same signing key to upgrade an installed copy), builds the minified release
+variant, and prints the signing fingerprints and SHA-256 of
+**`android/build/Inbox.apk`**. The APK runs on Android 8.0 or newer.
 
-To bake an OAuth client into the build, copy `client.properties.example` to
-`client.properties` first. Leave it out and every user goes through the
+To bake an OAuth client into the build, copy
+`android/client.properties.example` to `android/client.properties` first.
+Leave it out and every user goes through the
 bring-your-own-project route.
 
-## Send it to someone
+## Install on your phone
 
-`build/Inbox.apk` is the whole thing, about 2.4 MB. Mail it, AirDrop it, drop it
-in a chat. On the phone: open the file, allow the app store prompt about
-installing unknown apps, install, open, follow the wizard. If they are on the
-built-in connection and the Cloud project is still in Testing, add their Gmail
-address as a test user first, or Google refuses the sign-in; a project that has
-been published (even unverified, up to its 100-user cap) takes any account.
+Enable **Developer options → USB debugging**, connect the phone, and accept
+the USB authorization prompt. From the repository root:
+
+```sh
+"$ANDROID_HOME/platform-tools/adb" devices
+"$ANDROID_HOME/platform-tools/adb" install -r android/build/Inbox.apk
+```
+
+Alternatively, copy `Inbox.apk` to the phone, open it, allow **Install unknown
+apps** for the app opening the file, then install and follow the setup wizard.
+The release app and the `.debug` variant install separately.
+
+For updates, keep the signing key and use `install -r` so downloaded mail and
+local drafts stay intact. If Android reports a signing-key mismatch, rebuild
+with the original key; uninstalling the existing app deletes its local data.
+
+## Verification
+
+```sh
+cd android
+./gradlew :app:testDebugUnitTest :app:lintRelease
+```
+
+The JVM suite covers database reopening, account isolation, calendar cutoffs,
+paged download recovery, expired history/page tokens, large text parts and
+attachments, frozen outbox contents, interrupted sends, and Sent reconciliation.
+MockWebServer checks that the send transport does not replay POSTs or follow
+redirects.
+
+Before using it with your mailbox, verify on a phone: let the initial download
+finish, enable airplane mode, reopen a downloaded thread and attachment, save
+and reopen a draft, and queue a message to yourself. Restart Inbox while still
+offline, confirm the draft and Outbox persist, then reconnect and check Sent
+for delivery. Real Gmail authorization and device background scheduling require
+this device check; JVM tests use fake Gmail responses.
 
 ## Layout
 
@@ -161,10 +264,13 @@ been published (even unverified, up to its 100-user cap) takes any account.
       gmail/    GmailClient (REST, retry, metadata cache, history cursor),
                 Bundling / Mime / Unsub / UnsubResolver (app.py ports),
                 Models, Net
-      data/     MailStore (the view model), SnoozeStore, UnsubScanCache,
-                UnsubWebDriver (the JS-page rung), SwipeConfig, Prefs
+      data/     MailStore (the view model), MailDatabase (private offline
+                index/files + drafts), OfflineSync (resumable downloads),
+                OfflineMail (app-lifetime draft writer), OutboxProcessor,
+                Connectivity, SnoozeStore, UnsubScanCache, UnsubWebDriver
+                (the JS-page rung), SwipeConfig, Prefs
       ui/       Theme + MIcon, SetupWizard, RootScreen, MailList,
                 SwipeableRow, ThreadScreen (+ ThreadHtml), ComposeScreen,
-                SnoozeSheet, SettingsScreen
-      work/     SnoozeWorker (wakes one thread), NewMailWorker (poll +
-                banners), Notifications
+                DraftList, SnoozeSheet, SettingsScreen
+      work/     MailWork (offline downloads + outbox), SnoozeWorker (wakes
+                one thread), NewMailWorker (poll + banners), Notifications
