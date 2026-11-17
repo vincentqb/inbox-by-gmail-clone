@@ -99,4 +99,16 @@ class MailDatabaseTest : MailDatabaseTestBase() {
         db.prune(ACCOUNT, TEST_NOW, "inventory")
         assertEquals(listOf("keep"), db.messages(ACCOUNT, 0).map { it.id })
     }
+
+    @Test fun labelChangesKeepHeadersDateAndBody() {
+        db.putMessage(ACCOUNT, email("kept", labels = listOf("INBOX", "UNREAD")))
+        assertTrue(db.applyLabelDelta(ACCOUNT, "kept", added = emptyList(), removed = listOf("INBOX", "UNREAD")))
+        val meta = db.messages(ACCOUNT, 0).single()
+        assertEquals(emptyList<String>(), meta.labelIds)
+        assertEquals(TEST_NOW.toString(), meta.internalDate)
+        assertEquals("Preview for kept", meta.snippet)
+        assertFalse(db.applyLabelDelta(ACCOUNT, "not-saved", added = listOf("INBOX"), removed = emptyList()))
+        assertTrue(db.applyLabelDelta(ACCOUNT, "kept", added = listOf("SPAM"), removed = emptyList()))
+        assertNull(db.message(ACCOUNT, "kept"))
+    }
 }

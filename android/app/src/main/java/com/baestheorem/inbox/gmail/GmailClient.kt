@@ -513,8 +513,12 @@ object GmailClient : MailSyncGateway, OutboxGateway {
         val response = request("POST", "/threads/$id/modify", jsonBody = body.toString())
         withContext(Dispatchers.IO) {
             if (account.isNotBlank() && OfflineMail.db.owner() == MailDatabase.normalize(account)) {
+                // The response lists the thread's messages without headers or dates, so apply
+                // exactly the change made here and leave the saved copies otherwise alone.
                 val thread = Net.json.decodeFromString(GThread.serializer(), response)
-                thread.messages.forEach { OfflineMail.db.updateMetadata(account, it) }
+                OfflineMail.db.transaction {
+                    thread.messages.forEach { OfflineMail.db.applyLabelDelta(account, it.id, add, remove) }
+                }
                 OfflineMail.publish()
             }
         }

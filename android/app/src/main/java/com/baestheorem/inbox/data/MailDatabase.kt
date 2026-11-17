@@ -75,6 +75,20 @@ class MailDatabase(context: Context, name: String = "offline-mail.db") :
         if (root.exists() && !root.deleteRecursively()) throw IOException("Could not clear downloaded mail.")
     }
 
+    /** One SQLite transaction (one disk sync) for many small writes. */
+    @Synchronized
+    fun <T> transaction(block: () -> T): T {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val result = block()
+            db.setTransactionSuccessful()
+            return result
+        } finally {
+            db.endTransaction()
+        }
+    }
+
     private fun checkOwner(account: String) {
         if (normalize(account).isEmpty() || owner() != normalize(account)) throw AccountChangedException()
     }
@@ -199,6 +213,28 @@ class MailDatabase(context: Context, name: String = "offline-mail.db") :
             generation?.let { put("generation", it) }
         }
         writableDatabase.update("messages", values, "id=?", arrayOf(message.id))
+    }
+
+    /**
+     * One label change, applied to a saved message without touching its headers, date or
+     * body. A message moved to Spam or Trash leaves the cache. False when it isn't saved.
+     */
+    @Synchronized
+    fun applyLabelDelta(account: String, id: String, added: List<String>, removed: List<String>): Boolean {
+        checkOwner(account)
+        val meta = readableDatabase.query(
+            "messages", arrayOf("metadata"), "id=?", arrayOf(id), null, null, null,
+        ).use { if (it.moveToFirst()) Net.json.decodeFromString(GMessage.serializer(), it.getString(0)) else null }
+            ?: return false
+        val labels = meta.labelIds.filterNot { it in removed } + added.filterNot { it in meta.labelIds || it in removed }
+        if (labels.any { it in OfflinePolicy.excludedLabels }) {
+            removeMessage(account, id)
+            return true
+        }
+        writableDatabase.update("messages", ContentValues().apply {
+            put("metadata", Net.json.encodeToString(GMessage.serializer(), meta.copy(labelIds = labels)))
+        }, "id=?", arrayOf(id))
+        return true
     }
 
     @Synchronized
