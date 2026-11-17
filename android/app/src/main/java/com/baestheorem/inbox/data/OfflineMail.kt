@@ -1,6 +1,7 @@
 package com.baestheorem.inbox.data
 
 import android.content.Context
+import com.baestheorem.inbox.AppOpens
 import com.baestheorem.inbox.auth.AuthStore
 import com.baestheorem.inbox.gmail.GmailClient
 import com.baestheorem.inbox.gmail.GThread
@@ -18,6 +19,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import java.io.IOException
 
 /** App-lifetime writer: closing an editor/Activity does not cancel its pending save. */
@@ -34,6 +36,11 @@ object OfflineMail {
     val status: StateFlow<OfflineStatus> = _status
     val revision = MutableStateFlow(0L)
     private lateinit var outbox: OutboxProcessor
+    /** One per process, so what it learns about the quota carries across runs. */
+    private val pacer = SyncPacer(
+        rateLimitedAt = { GmailClient.rateLimitedAt },
+        foreground = { AppOpens.foreground },
+    )
 
     fun init(app: Context) {
         if (::context.isInitialized) return
@@ -45,7 +52,10 @@ object OfflineMail {
         }
         scope.launch {
             if (AuthStore.isSignedIn && AuthStore.account.isNotBlank()) {
-                try { activate(AuthStore.account) } catch (e: IOException) {
+                try {
+                    activate(AuthStore.account)
+                    indexBacklog(AuthStore.account)
+                } catch (e: IOException) {
                     _status.value = _status.value.copy(error = e.message)
                 }
             } else if (!AuthStore.isSignedIn) {
@@ -105,18 +115,42 @@ object OfflineMail {
         db.replyDraft(AuthStore.account, threadId)
     }
 
-    /** Keep a just-opened recent message even before the inventory reaches it. */
+    /**
+     * An opened thread is kept whole, whatever its age, for two months after the last time
+     * it was opened ([markOpened]). Text is stored now; the worker finishes any attachments.
+     */
     suspend fun cacheOpenedThread(account: String, thread: GThread) = withContext(Dispatchers.IO) {
-        val cutoff = OfflinePolicy.cutoff(System.currentTimeMillis())
-        for (message in thread.messages.filter { OfflinePolicy.includes(it, cutoff) }) {
-            if (db.hasMessage(account, message.id)) db.updateMetadata(account, message)
-            else {
-                db.putMessage(account, message, db.syncState(account).checkpoint?.generation)
+        val generation = db.syncState(account).checkpoint?.generation
+        for (message in thread.messages) {
+            if (db.hasMessage(account, message.id)) db.applyLabels(account, message.id, message.labelIds)
+            else if (!OfflinePolicy.excluded(message.labelIds)) {
+                db.putMessage(account, message, generation)
                 if (OfflinePolicy.attachmentIds(message.payload).isEmpty()) db.markComplete(account, message.id)
             }
         }
         publish()
         syncNow()
+    }
+
+    /** Opening a thread, online or offline, keeps it for two more months. Doesn't wait. */
+    fun markOpened(account: String, threadId: String) {
+        if (account.isBlank()) return
+        val at = System.currentTimeMillis()
+        scope.launch {
+            try {
+                if (db.owner() == MailDatabase.normalize(account)) db.markOpened(account, threadId, at)
+            } catch (e: IOException) {
+                // the account changed meanwhile; nothing to keep
+            }
+        }
+    }
+
+    /** Mail saved before offline search existed gets indexed in the background, in batches. */
+    private suspend fun indexBacklog(account: String) = withContext(Dispatchers.IO) {
+        while (AuthStore.account == account && db.owner() == MailDatabase.normalize(account)) {
+            if (db.indexBacklog(account, 50) == 0) break
+            yield()
+        }
     }
 
     fun queue(draft: LocalDraft): Deferred<LocalDraft> = write {
@@ -164,7 +198,10 @@ object OfflineMail {
         activate(account)
         _status.value = _status.value.copy(syncing = true, error = null)
         try {
-            OfflineSync(db, GmailClient.boundSyncGateway(), changed = { publish() }).run(account, deadline)
+            OfflineSync(
+                db, GmailClient.boundSyncGateway(), changed = { publish() },
+                pace = pacer::acquire, freeSpace = db::freeSpace,
+            ).run(account, deadline)
         } catch (e: IOException) {
             _status.value = _status.value.copy(error = e.message ?: "Download paused. Will retry when connected.")
             throw e

@@ -21,8 +21,8 @@ class MailDatabaseTest : MailDatabaseTestBase() {
         reopenDatabase()
 
         assertEquals(1 to 1, db.counts(ACCOUNT))
-        assertEquals(text, decodeBody(db.thread(ACCOUNT, "thread-large", 0)!!.messages.single().payload).text)
-        assertNull(db.messages(ACCOUNT, 0).single().payload?.body?.data)
+        assertEquals(text, decodeBody(db.thread(ACCOUNT, "thread-large")!!.messages.single().payload).text)
+        assertNull(db.messages(ACCOUNT).single().payload?.body?.data)
         assertArrayEquals(byteArrayOf(0, 1, 2, 127, -1), db.attachment(ACCOUNT, "large", "pdf"))
         assertEquals("Reader", db.displayName(ACCOUNT))
         assertEquals("Inbox", db.labels(ACCOUNT).single().name)
@@ -88,22 +88,23 @@ class MailDatabaseTest : MailDatabaseTestBase() {
     }
 
     @Test fun labelChangesAndBodyHydrationPreserveInventoryGeneration() {
+        val cutoff = OfflinePolicy.cutoff(TEST_NOW)
         val original = email("keep")
         db.putMessage(ACCOUNT, original, "inventory")
-        db.updateMetadata(ACCOUNT, original.copy(labelIds = listOf("SENT"), payload = null))
+        db.applyLabels(ACCOUNT, "keep", listOf("SENT"))
         assertEquals(listOf("SENT"), db.message(ACCOUNT, "keep")!!.labelIds)
         assertEquals("Saved body for keep", decodeBody(db.message(ACCOUNT, "keep")!!.payload).text)
         db.putMessage(ACCOUNT, db.message(ACCOUNT, "keep")!!)
         db.putMessage(ACCOUNT, email("unseen"), "old")
-        db.putMessage(ACCOUNT, email("too-old", date = TEST_NOW - 1), "inventory")
-        db.prune(ACCOUNT, TEST_NOW, "inventory")
-        assertEquals(listOf("keep"), db.messages(ACCOUNT, 0).map { it.id })
+        db.putMessage(ACCOUNT, email("too-old", date = cutoff - 1), "old")
+        db.finishInventory(ACCOUNT, cutoff, "inventory", snoozedLabel = null)
+        assertEquals(listOf("keep"), db.messages(ACCOUNT).map { it.id })
     }
 
     @Test fun labelChangesKeepHeadersDateAndBody() {
         db.putMessage(ACCOUNT, email("kept", labels = listOf("INBOX", "UNREAD")))
         assertTrue(db.applyLabelDelta(ACCOUNT, "kept", added = emptyList(), removed = listOf("INBOX", "UNREAD")))
-        val meta = db.messages(ACCOUNT, 0).single()
+        val meta = db.messages(ACCOUNT).single()
         assertEquals(emptyList<String>(), meta.labelIds)
         assertEquals(TEST_NOW.toString(), meta.internalDate)
         assertEquals("Preview for kept", meta.snippet)

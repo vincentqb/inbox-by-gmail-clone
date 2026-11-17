@@ -75,9 +75,24 @@ data class GRawMessage(val raw: String? = null)
 data class DetailRow(val label: String, val value: String)
 
 // history.list: one record per mailbox change; `messages` is the union of every
-// message the record touched, which is all the cache invalidation needs.
+// message the record touched, which is all the cache invalidation needs. The typed
+// lists say what happened, so the offline copy can apply label changes without
+// fetching the message again. Their `message` carries id, threadId and labelIds.
 @Serializable
-data class GHistoryRecord(val id: String? = null, val messages: List<GMessageRef> = emptyList())
+data class GHistoryRecord(
+    val id: String? = null,
+    val messages: List<GMessageRef> = emptyList(),
+    val messagesAdded: List<GHistoryMessage> = emptyList(),
+    val messagesDeleted: List<GHistoryMessage> = emptyList(),
+    val labelsAdded: List<GHistoryLabels> = emptyList(),
+    val labelsRemoved: List<GHistoryLabels> = emptyList(),
+)
+
+@Serializable
+data class GHistoryMessage(val message: GMessage)
+
+@Serializable
+data class GHistoryLabels(val message: GMessage, val labelIds: List<String> = emptyList())
 
 @Serializable
 data class GHistoryList(

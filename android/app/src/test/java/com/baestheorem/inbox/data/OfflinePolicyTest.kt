@@ -46,6 +46,10 @@ class OfflinePolicyTest {
             "text" to text.toByteArray(), "html" to "<p>$text</p>".toByteArray(),
             "named" to "Not the body".toByteArray(), "disposition" to "Also not the body".toByteArray(),
         ))!!
+        assertEquals(setOf("text", "html"), OfflinePolicy.textPartIds(payload))
+        assertEquals(setOf("named", "disposition", "image"), OfflinePolicy.fileIds(payload))
+        assertEquals(setOf("text", "html"), OfflinePolicy.missingTextIds(payload))
+        assertTrue(OfflinePolicy.missingTextIds(hydrated).isEmpty())
         assertEquals(text, decodeBody(hydrated).text)
         assertEquals("<p>$text</p>", decodeBody(hydrated).html)
         assertNull(hydrated.parts[1].body?.data)

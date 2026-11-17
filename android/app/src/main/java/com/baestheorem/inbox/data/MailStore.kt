@@ -205,9 +205,8 @@ class MailStore(app: Application) : AndroidViewModel(app) {
         val selectedMode = mode.value
         val snapshot = withContext(Dispatchers.IO) {
             if (OfflineMail.db.owner() != MailDatabase.normalize(account)) return@withContext null
-            val messages = OfflineMail.db.messages(
-                account, OfflinePolicy.cutoff(System.currentTimeMillis()), withBodies = selectedMode is MailMode.Search,
-            )
+            val messages = if (selectedMode is MailMode.Search) OfflineMail.db.search(account, selectedMode.q)
+            else OfflineMail.db.messages(account)
             messages to OfflineMail.db.labels(account)
         } ?: return false
         if (selectedMode != mode.value || account != AuthStore.account) return false
@@ -215,23 +214,13 @@ class MailStore(app: Application) : AndroidViewModel(app) {
         bundleOverrides = labels.mapNotNull { l ->
             l.name?.takeIf { it.startsWith("Bundle/") }?.let { l.id to it.removePrefix("Bundle/") }
         }.toMap()
-        val snoozedLabel = labels.firstOrNull { it.name == "Snoozed" }?.id
+        val snoozedLabel = labels.firstOrNull { it.name == SNOOZED_LABEL }?.id
         val selected = when (selectedMode) {
             is MailMode.Inbox, is MailMode.BundleFilter -> all.filter { "INBOX" in it.labelIds }
             is MailMode.Sent -> all.filter { "SENT" in it.labelIds }
             is MailMode.Snoozed -> all.filter { snoozedLabel != null && snoozedLabel in it.labelIds }
             is MailMode.Done -> all.filter { "INBOX" !in it.labelIds && "SENT" !in it.labelIds }
-            is MailMode.Search -> {
-                val terms = selectedMode.q.lowercase().split(Regex("\\s+")).filter { it.isNotBlank() }
-                all.filter { m ->
-                    val text = buildString {
-                        append(m.snippet).append(' ')
-                        m.payload?.headers?.forEach { append(it.value).append(' ') }
-                        append(decodeBody(m.payload).text)
-                    }.lowercase()
-                    terms.all { it in text }
-                }
-            }
+            is MailMode.Search -> all // already matched by the search index
             else -> emptyList()
         }
         var rows = withContext(Dispatchers.Default) {
@@ -384,7 +373,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
     private suspend fun fetchListPage(pageToken: String?): Pair<GMessageList, Boolean> =
         when (val m = mode.value) {
             is MailMode.Snoozed -> {
-                val sid = GmailClient.ensureLabel("Snoozed")
+                val sid = GmailClient.ensureLabel(SNOOZED_LABEL)
                 GmailClient.listMessages(listOf(sid), maxResults = pageSize, pageToken = pageToken) to false
             }
             is MailMode.Done -> GmailClient.listMessages(
@@ -603,7 +592,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
         removeEverywhere(t.id)
         viewModelScope.launch {
             try {
-                val sid = GmailClient.ensureLabel("Snoozed")
+                val sid = GmailClient.ensureLabel(SNOOZED_LABEL)
                 GmailClient.modifyThread(t.id, add = listOf(sid), remove = listOf("INBOX"))
                 SnoozeStore.add(t.id, wake, t.subject)
             } catch (e: IOException) {
@@ -612,7 +601,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
             }
         }
         showSnack("Snoozed until $desc") {
-            val sid = runCatching { GmailClient.ensureLabel("Snoozed") }.getOrNull()
+            val sid = runCatching { GmailClient.ensureLabel(SNOOZED_LABEL) }.getOrNull()
             runCatching {
                 GmailClient.modifyThread(
                     t.id, add = listOf("INBOX"),
@@ -629,7 +618,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
         removeEverywhere(t.id)
         viewModelScope.launch {
             try {
-                val sid = GmailClient.ensureLabel("Snoozed")
+                val sid = GmailClient.ensureLabel(SNOOZED_LABEL)
                 GmailClient.modifyThread(t.id, add = listOf("INBOX"), remove = listOf(sid))
                 SnoozeStore.remove(t.id)
             } catch (e: IOException) {
@@ -736,8 +725,10 @@ class MailStore(app: Application) : AndroidViewModel(app) {
         val account = AuthStore.account
         val cached = withContext(Dispatchers.IO) {
             if (account.isBlank() || OfflineMail.db.owner() != MailDatabase.normalize(account)) null
-            else OfflineMail.db.thread(account, threadId, OfflinePolicy.cutoff(System.currentTimeMillis()))
+            else OfflineMail.db.thread(account, threadId)
         }
+        // Looking at a thread keeps it on the phone for two more months.
+        OfflineMail.markOpened(account, threadId)
         if (!canAccessGmail()) {
             val thread = cached ?: throw IOException("This email has not downloaded yet. Connect to download it.")
             return withContext(Dispatchers.Default) { parseThread(thread, threadId).detail }
@@ -763,26 +754,17 @@ class MailStore(app: Application) : AndroidViewModel(app) {
         if (account.isNotBlank()) OfflineMail.cacheOpenedThread(account, th)
         val readable = withContext(Dispatchers.IO) {
             th.copy(messages = th.messages.map { message ->
-                val full = if (message.payload?.body?.data == null &&
-                    OfflinePolicy.attachmentIds(message.payload).isNotEmpty()) {
-                    val bytes = mutableMapOf<String, ByteArray>()
-                    fun textParts(part: com.baestheorem.inbox.gmail.GPayload?) {
-                        if (part == null) return
-                        if (part.mimeType in setOf("text/plain", "text/html") && part.filename.isNullOrEmpty()) {
-                            part.body?.attachmentId?.let { bytes[it] = byteArrayOf() }
-                        }
-                        part.parts.forEach(::textParts)
-                    }
-                    textParts(message.payload)
-                    for (aid in bytes.keys.toList()) bytes[aid] = GmailClient.attachmentData(message.id, aid)
+                // Only text not saved yet: a saved copy may already have it (and work offline).
+                val missing = OfflinePolicy.missingTextIds(message.payload)
+                val full = if (missing.isNotEmpty()) {
+                    val bytes = missing.associateWith { GmailClient.attachmentData(message.id, it) }
                     message.copy(payload = OfflinePolicy.hydrateTextParts(message.payload, bytes))
                 } else message
-                if (full != message && account.isNotBlank() &&
-                    OfflinePolicy.includes(full, OfflinePolicy.cutoff(System.currentTimeMillis()))) {
-                    OfflineMail.db.putMessage(account, full)
-                    if (OfflinePolicy.attachmentIds(full.payload).all { OfflineMail.db.attachment(account, full.id, it) != null }) {
-                        OfflineMail.db.markComplete(account, full.id)
-                    }
+                // Body text only: the sync may have changed labels or removed the message since
+                // this copy was fetched, and its changes win.
+                if (full != message && account.isNotBlank() && OfflineMail.db.updateBody(account, full) &&
+                    OfflinePolicy.fileIds(full.payload).all { OfflineMail.db.attachment(account, full.id, it) != null }) {
+                    OfflineMail.db.markComplete(account, full.id)
                 }
                 full
             })

@@ -20,6 +20,9 @@ import java.util.concurrent.TimeUnit
 @Serializable
 data class SnoozeRecord(val threadId: String, val wake: Long, val subject: String)
 
+/** The Gmail label snoozed mail waits under, shared with the Mac app. */
+const val SNOOZED_LABEL = "Snoozed"
+
 /**
  * Phone-local half of the snooze scheduler. Label ops (remove INBOX, add
  * Snoozed) live in Gmail like the Mac server's; the wake time lives here plus a
@@ -108,7 +111,7 @@ object SnoozeStore {
 
     /** The label flip itself, shared with SnoozeWorker. */
     suspend fun wakeThread(threadId: String): Boolean = try {
-        val sid = GmailClient.ensureLabel("Snoozed")
+        val sid = GmailClient.ensureLabel(SNOOZED_LABEL)
         GmailClient.modifyThread(threadId, add = listOf("INBOX"), remove = listOf(sid))
         remove(threadId)
         true

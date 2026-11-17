@@ -659,14 +659,16 @@ object GmailClient : MailSyncGateway, OutboxGateway {
     override suspend fun labels(): List<GLabel> = listLabels()
     override suspend fun list(query: String, page: String?): GMessageList =
         listMessages(q = query, maxResults = 500, pageToken = page)
-    override suspend fun metadata(id: String): GMessage = get(
-        "/messages/$id", listOf("format" to "full", "fields" to LIST_FIELDS), serializer = GMessage.serializer(),
+    override suspend fun minimal(id: String): GMessage = get(
+        "/messages/$id", listOf("format" to "minimal"), serializer = GMessage.serializer(),
     )
     override suspend fun message(id: String): GMessage = get(
         "/messages/$id", listOf("format" to "full"), serializer = GMessage.serializer(),
     )
     override suspend fun history(start: String, page: String?): GHistoryList {
         val query = mutableListOf("startHistoryId" to start, "maxResults" to "500")
+        // Named explicitly: the reference doesn't promise every type when this is omitted.
+        for (t in listOf("messageAdded", "messageDeleted", "labelAdded", "labelRemoved")) query.add("historyTypes" to t)
         page?.let { query.add("pageToken" to it) }
         return get("/history", query, serializer = GHistoryList.serializer())
     }
@@ -682,7 +684,7 @@ object GmailClient : MailSyncGateway, OutboxGateway {
             override suspend fun profile() = bound { GmailClient.profile() }
             override suspend fun labels() = bound { GmailClient.labels() }
             override suspend fun list(query: String, page: String?) = bound { GmailClient.list(query, page) }
-            override suspend fun metadata(id: String) = bound { GmailClient.metadata(id) }
+            override suspend fun minimal(id: String) = bound { GmailClient.minimal(id) }
             override suspend fun message(id: String) = bound { GmailClient.message(id) }
             override suspend fun attachment(id: String, attachmentId: String) = bound {
                 GmailClient.attachment(id, attachmentId)

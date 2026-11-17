@@ -87,26 +87,50 @@ you do not need to obtain or paste a short-lived access token manually.
 
 ## Offline mail, drafts, and Outbox
 
-On sign-in, the Android app automatically downloads a rolling two-month window
-of email. It uses UTC calendar-month arithmetic: on October 30, the window
-starts on August 30 at the same UTC time. It includes Inbox, Sent, archived,
-and snoozed mail, and excludes Spam, Trash, Gmail Drafts, and Chats.
+On sign-in, the Android app automatically downloads the last two months of
+email. It uses UTC calendar-month arithmetic: on October 30, the window starts
+on August 30 at the same UTC time. It includes Inbox, Sent, archived, and
+snoozed mail, and excludes Spam, Trash, Gmail Drafts, and Chats. Opening a
+thread, online or offline, also keeps that whole thread on the phone, whatever
+its age.
+
+A thread stays on the phone while any of these holds: its newest message arrived
+in the last two months, you opened it in the last two months, it is pinned or
+snoozed, or a local draft or Outbox item replies to it. Once a day the app
+removes threads that no longer qualify, a hundred at a time, oldest first. When
+the phone has less than 500 MB free, it stops downloading attachments and
+deletes saved attachments from the least recently used threads until 750 MB is
+free. Their text stays, and opening a trimmed attachment while connected
+downloads it again.
 
 Full message bodies, MIME inline images, and attachments are saved in the app's
-private storage. Downloads resume from a durable checkpoint after a connection
-failure or process restart. Gmail history updates keep the cache current, a
-daily inventory checks for missed changes, and older mail is removed from the
-downloaded window. **Settings → Offline mail** shows saved and fully downloaded
-counts and offers **Sync now**. Let the first download finish while connected
-before relying on airplane mode; a saved body may become readable before its
-attachments finish downloading.
+private storage. Syncing follows Google's
+[guide for Gmail clients](https://developers.google.com/workspace/gmail/api/guides/sync):
+a full download on first sign-in, then Gmail's change history, which applies
+label changes without downloading messages again and fetches only new mail. A
+full resync runs only when Gmail no longer has the history since the last sync
+(it keeps about a week), and it checks mail already saved with a cheap
+labels-only request. Every step resumes where it stopped after a time limit, a
+connection failure, or a process restart. **Settings → Offline mail** shows
+saved and fully downloaded counts and offers **Sync now**. Let the first
+download finish while connected before relying on airplane mode; a saved body
+may become readable before its attachments finish downloading.
+
+Background downloads share Gmail's per-user quota with the app's own screens.
+Under Gmail's [usage limits](https://developers.google.com/workspace/gmail/api/reference/quota)
+as revised on May 1, 2026, that is 6,000 units a minute, and one full message
+costs 60. The sync starts at half of that, halves again whenever Gmail reports
+a rate limit, and recovers while quiet. It goes faster only while the app is in
+the background, which lets Cloud projects that kept Gmail's older, larger quota
+download sooner.
 
 While offline, you can read downloaded threads and open downloaded attachments
-in Inbox, Done, Sent, and Snoozed. Offline search matches ordinary words against
-cached subjects, senders, previews, and text bodies; Gmail query operators work
-when connected. Earlier messages in a conversation, externally hosted images,
-**Show original**, and Gmail changes such as archive, pin, snooze, or unsubscribe
-require a connection.
+in Inbox, Done, Sent, and Snoozed. Offline search matches the beginnings of
+words in saved subjects, senders and recipients, previews, and message text,
+using an index on the phone; Gmail query operators work when connected. Earlier
+messages of a conversation you haven't opened on this phone, externally hosted
+images, **Show original**, and Gmail changes such as archive, pin, snooze, or
+unsubscribe require a connection.
 
 Compose and reply/reply-all save typed changes locally. **Save draft** finishes
 the save before closing; the **Drafts** drawer entry lets you reopen it after
@@ -250,9 +274,13 @@ cd android
 ./gradlew :app:testDebugUnitTest :app:lintRelease
 ```
 
-The JVM suite covers database reopening, account isolation, calendar cutoffs,
-paged download recovery, expired history/page tokens, large text parts and
-attachments, frozen outbox contents, interrupted sends, and Sent reconciliation.
+The JVM suite covers database reopening and the upgrade from the first offline
+version, account isolation, calendar cutoffs, paged download recovery, history
+that takes several time-limited runs, label changes applied from history,
+expired history/page tokens, thread retention and eviction, low-storage
+trimming, offline search, quota pacing, the once-per-open sign-in prompt, large
+text parts and attachments, frozen outbox contents, interrupted sends, and Sent
+reconciliation.
 MockWebServer checks that the send transport does not replay POSTs or follow
 redirects.
 
@@ -266,14 +294,17 @@ this device check; JVM tests use fake Gmail responses.
 ## Layout
 
     app/src/main/java/com/baestheorem/inbox/
+      AppOpens  counts app opens (cold start or return, not rotation)
       auth/     AuthStore (encrypted client + refresh token), OAuthFlow
                 (loopback PKCE + state), AuthSession (the in-flight
-                attempt, process-scoped), ClientCredentials (paste parser)
+                attempt, process-scoped), ClientCredentials (paste parser),
+                ReauthPolicy (when sign-in opens by itself)
       gmail/    GmailClient (REST, retry, metadata cache, history cursor),
                 Bundling / Mime / Unsub / UnsubResolver (app.py ports),
                 Models, Net
       data/     MailStore (the view model), MailDatabase (private offline
-                index/files + drafts), OfflineSync (resumable downloads),
+                index/files, retention, search index, drafts), OfflineSync
+                (full and history sync, resumable), SyncPacer (quota budget),
                 OfflineMail (app-lifetime draft writer), OutboxProcessor,
                 Connectivity, SnoozeStore, UnsubScanCache, UnsubWebDriver
                 (the JS-page rung), SwipeConfig, Prefs

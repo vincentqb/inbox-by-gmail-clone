@@ -73,13 +73,14 @@ internal class FakeSyncGateway : MailSyncGateway {
     val historyPages = mutableMapOf<String?, GHistoryList>(null to GHistoryList(historyId = "200"))
     val attachmentBytes = mutableMapOf<Pair<String, String>, ByteArray>()
     val fullRequests = mutableListOf<String>()
-    val metadataRequests = mutableListOf<String>()
+    val minimalRequests = mutableListOf<String>()
     val listRequests = mutableListOf<Pair<String, String?>>()
     val historyRequests = mutableListOf<Pair<String, String?>>()
     val attachmentRequests = mutableListOf<Pair<String, String>>()
     var beforeList: (String?) -> Unit = {}
     var beforeHistory: (String?) -> Unit = {}
     var beforeAttachment: (String, String) -> Unit = { _, _ -> }
+    var beforeMessage: (String) -> Unit = {}
 
     override suspend fun profile() = identity
     override suspend fun labels() = listOf(GLabel("INBOX", "INBOX"))
@@ -88,12 +89,13 @@ internal class FakeSyncGateway : MailSyncGateway {
         beforeList(page)
         return pages.getValue(page)
     }
-    override suspend fun metadata(id: String): GMessage {
-        metadataRequests.add(id)
-        return messageValue(id).copy(payload = null)
+    override suspend fun minimal(id: String): GMessage {
+        minimalRequests.add(id)
+        return messageValue(id).let { GMessage(id = it.id, threadId = it.threadId, labelIds = it.labelIds) }
     }
     override suspend fun message(id: String): GMessage {
         fullRequests.add(id)
+        beforeMessage(id)
         return messageValue(id)
     }
     private fun messageValue(id: String): GMessage =
@@ -103,9 +105,12 @@ internal class FakeSyncGateway : MailSyncGateway {
         beforeAttachment(id, attachmentId)
         return attachmentBytes.getValue(id to attachmentId)
     }
+    /** Pages for one cursor; [historyPages] answers any cursor. */
+    val historyAt = mutableMapOf<Pair<String, String?>, GHistoryList>()
+
     override suspend fun history(start: String, page: String?): GHistoryList {
         historyRequests.add(start to page)
         beforeHistory(page)
-        return historyPages.getValue(page)
+        return historyAt[start to page] ?: historyPages.getValue(page)
     }
 }
