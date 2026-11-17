@@ -81,6 +81,10 @@ object GmailClient : MailSyncGateway, OutboxGateway {
     private var cachedEmail: String? = null
     private var cachedDisplayName: String? = null
 
+    /** When Gmail last said this user is over quota; background sync slows down for it. */
+    @Volatile var rateLimitedAt = 0L
+        private set
+
     /** Flips when Google stops honoring the refresh token; the UI re-runs the wizard. */
     private val _authExpired = MutableStateFlow(false)
     val authExpired: StateFlow<Boolean> = _authExpired
@@ -267,6 +271,7 @@ object GmailClient : MailSyncGateway, OutboxGateway {
                     body.contains("rateLimitExceeded") || body.contains("Quota exceeded") ||
                         body.contains("userRateLimitExceeded") || body.contains("backendError")
                     )
+                if (code == 429 || rateLimited) rateLimitedAt = System.currentTimeMillis()
                 if (code in listOf(429, 500, 502, 503, 504) || rateLimited) {
                     Log.w(TAG, "$code on $path attempt ${attempt + 1}/$tries")
                     attempt++
