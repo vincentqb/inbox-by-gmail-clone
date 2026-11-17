@@ -28,6 +28,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.baestheorem.inbox.auth.AuthStore
 import com.baestheorem.inbox.auth.AuthSession
+import com.baestheorem.inbox.auth.ReauthPolicy
 import com.baestheorem.inbox.data.Connectivity
 import com.baestheorem.inbox.data.MailStore
 import com.baestheorem.inbox.data.Prefs
@@ -77,6 +78,16 @@ class MainActivity : ComponentActivity() {
         if (s != null) s.deepLinkThreadId.value = tid else pendingThreadId = tid
     }
 
+    override fun onStart() {
+        super.onStart()
+        AppOpens.onStart()
+    }
+
+    override fun onStop() {
+        AppOpens.onStop(isChangingConfigurations)
+        super.onStop()
+    }
+
     override fun onResume() {
         super.onResume()
         if (!AuthStore.isSignedIn) return
@@ -120,6 +131,23 @@ private fun App(onStoreReady: (MailStore) -> Unit, onSignedIn: () -> Unit) {
         SetupWizard(onDone = { signedIn = AuthStore.isSignedIn })
         return
     }
+    val expired by store.authExpired.collectAsState()
+    val online by Connectivity.online.collectAsState()
+    val open by AppOpens.opens.collectAsState()
+
+    // Like other apps: a dead Google session puts sign-in up when the app opens. Once per
+    // open, so backing out leaves the banner and the downloaded mail.
+    LaunchedEffect(expired, online, open, reauthorize) {
+        if (ReauthPolicy.shouldPrompt(
+                expired, online, open, AppOpens.promptedOpen,
+                sinceOpen = System.currentTimeMillis() - AppOpens.openedAt,
+                showing = reauthorize, inFlight = AuthSession.inFlight,
+            )) {
+            AppOpens.promptedOpen = open
+            AuthSession.consume()
+            reauthorize = true
+        }
+    }
 
     LaunchedEffect(Unit) {
         onStoreReady(store)
@@ -137,6 +165,7 @@ private fun App(onStoreReady: (MailStore) -> Unit, onSignedIn: () -> Unit) {
             AuthSession.cancel()
         },
         onReauthorize = {
+            AppOpens.promptedOpen = AppOpens.opens.value
             AuthSession.consume()
             reauthorize = true
         },
@@ -144,14 +173,21 @@ private fun App(onStoreReady: (MailStore) -> Unit, onSignedIn: () -> Unit) {
     if (reauthorize) {
         // Keep the reader/editor alive beneath sign-in, so token expiry does
         // not take away downloaded mail or a reply the user is writing.
-        SetupWizard(onDone = {
-            reauthorize = false
-            store.bootstrap()
-            MailWork.schedule(context)
-        })
-        BackHandler {
+        val dismiss = {
             AuthSession.cancel()
+            AppOpens.promptedOpen = AppOpens.opens.value
             reauthorize = false
         }
+        SetupWizard(
+            reauth = true,
+            onDone = {
+                AppOpens.promptedOpen = AppOpens.opens.value
+                reauthorize = false
+                store.bootstrap()
+                MailWork.schedule(context)
+            },
+            onCancel = dismiss,
+        )
+        BackHandler { dismiss() }
     }
 }

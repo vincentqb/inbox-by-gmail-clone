@@ -61,8 +61,14 @@ client is rejected by the wizard, because its redirect rules do not fit.
 A Cloud project whose consent screen is **External** and whose publishing status
 is still **Testing** gets refresh tokens that expire after 7 days ([Google's
 docs](https://developers.google.com/identity/protocols/oauth2#expiration)).
-The app notices (`invalid_grant`) and offers **Sign in again**, while keeping
-downloaded mail and local drafts available. Publishing the consent screen to
+The app notices (`invalid_grant`). The next time you open the app with a
+connection, Google's sign-in page opens by itself for the same account, without
+the warning explainer you saw during setup; finish it and you are back where you
+were. Back out and a **Sign in again** banner stays, with downloaded mail and
+local drafts still available; the page opens again the next time you open the
+app. If Google signs the app out while you are using it, only the banner
+appears, so the page never opens over a reply you are writing. Publishing the
+consent screen to
 **Production** removes this Testing-specific expiry; Google can still revoke
 tokens for other reasons. Publishing is separate from Google's verification
 process and from building the release APK.

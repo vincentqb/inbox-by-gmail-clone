@@ -66,25 +66,41 @@ private const val URL_CLIENTS = "https://console.cloud.google.com/auth/clients"
  * recreated activity lands on the right screen.
  */
 @Composable
-fun SetupWizard(onDone: () -> Unit) {
+fun SetupWizard(onDone: () -> Unit, reauth: Boolean = false, onCancel: () -> Unit = {}) {
     val context = LocalContext.current
+    // Signing in again skips the explainer: Google's page opens at once, for the saved account.
+    val direct = reauth && AuthStore.hasClient
     var step by rememberSaveable {
-        mutableStateOf(if (AuthStore.hasClient) Step.CONSENT else Step.WELCOME)
+        mutableStateOf(if (direct) Step.SIGNING_IN else if (AuthStore.hasClient) Step.CONSENT else Step.WELCOME)
     }
+    var started by rememberSaveable { mutableStateOf(false) }
     var error by rememberSaveable { mutableStateOf<String?>(null) }
     var pasted by rememberSaveable { mutableStateOf("") }
     var account by remember { mutableStateOf(AuthStore.account) }
     val auth by AuthSession.state.collectAsState()
 
+    fun signIn() {
+        error = null
+        step = Step.SIGNING_IN
+        AuthSession.begin(context) { openInBrowser(context, it) }
+    }
+
     LaunchedEffect(auth) {
         when (val a = auth) {
-            AuthSession.State.Idle -> if (step == Step.SIGNING_IN) step = Step.CONSENT
+            AuthSession.State.Idle -> when {
+                direct && !started -> {
+                    started = true
+                    signIn()
+                }
+                step == Step.SIGNING_IN -> step = Step.CONSENT
+            }
             is AuthSession.State.Waiting -> step = Step.SIGNING_IN
             is AuthSession.State.Done -> {
                 account = a.account
                 error = null
-                step = Step.DONE
                 AuthSession.consume()
+                // Back to the mail the user was reading, the way other apps return after sign-in.
+                if (reauth) onDone() else step = Step.DONE
             }
             is AuthSession.State.Failed -> {
                 error = a.message
@@ -92,12 +108,6 @@ fun SetupWizard(onDone: () -> Unit) {
                 AuthSession.consume()
             }
         }
-    }
-
-    fun signIn() {
-        error = null
-        step = Step.SIGNING_IN
-        AuthSession.begin(context) { openInBrowser(context, it) }
     }
 
     Box(Modifier.fillMaxSize().background(Theme.pageBg)) {
@@ -153,7 +163,7 @@ fun SetupWizard(onDone: () -> Unit) {
                 Step.SIGNING_IN -> SigningIn(
                     onCancel = {
                         AuthSession.cancel()
-                        step = Step.CONSENT
+                        if (reauth) onCancel() else step = Step.CONSENT
                     }
                 )
                 Step.DONE -> Done(account = account, onOpen = onDone)
