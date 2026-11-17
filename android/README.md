@@ -127,9 +127,11 @@ for confirmation when delivery is uncertain, because a manual retry could
 produce a duplicate.
 
 Download and Outbox workers run independently of the notification switch, use
-Wi-Fi or mobile data, and run periodically at Android's 15-minute minimum.
-Reopening the app or reconnecting also schedules work. Android battery
-restrictions can delay it; after a force-stop, open the app to resume.
+Wi-Fi or mobile data, and run periodically at Android's 15-minute minimum. A
+download pass that reaches Android's 10-minute limit for background work queues
+its continuation straight away. Reopening the app or reconnecting also starts
+work, including a download pass that was waiting out a retry delay. Android
+battery restrictions can delay it; after a force-stop, open the app to resume.
 Signing out, resetting setup, uninstalling, or switching Gmail accounts removes
 the phone's downloaded mail and local drafts/Outbox. Signing out and resetting
 show the number of unsent items before clearing them.
